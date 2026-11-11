@@ -1,3 +1,6 @@
+> **Cititec fork** of [WYRE-AI/autotask-mcp](https://github.com/WYRE-AI/autotask-mcp). Before changing anything, read
+> [CITITEC-FORK.md](CITITEC-FORK.md): which changes go back to Wyre and which stay in this fork.
+
 # Autotask MCP Server
 
 [![Build Status](https://github.com/WYRE-AI/autotask-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/WYRE-AI/autotask-mcp/actions/workflows/release.yml)
