@@ -74,6 +74,8 @@ describe('Rate limit handling (#69, #91)', () => {
       expect(rateErr.retryAfterSeconds).toBe(180);
       expect(rateErr.message).toContain('Do NOT retry');
       expect(rateErr.message).toContain('IntegrationVendor exceeded');
+      // Rate-limit monitors that read tool errors key off this wording.
+      expect(rateErr.message).toMatch(/HTTP 429.*Try again in 180 s\./);
     });
 
     test('falls back to default 60s when Retry-After is missing', async () => {
@@ -142,7 +144,8 @@ describe('Rate limit handling (#69, #91)', () => {
       expect(parsed.error_type).toBe('rate_limited');
       expect(parsed.retry_after_seconds).toBe(120);
       expect(parsed.tool).toBe('autotask_search_tickets');
-      expect(parsed.instruction).toMatch(/Do not retry/);
+      expect(parsed.instruction).toMatch(/Do not retry this call immediately/);
+      expect(parsed.instruction).toMatch(/retry_after_seconds/);
     });
   });
 });

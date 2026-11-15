@@ -2,6 +2,7 @@
 // Handles loading configuration from environment variables and MCP client arguments
 // Supports gateway mode where credentials come via HTTP headers
 
+import { ACTING_USER_EMAIL_HEADER, parseActingUserEmail } from '../services/impersonation-resolver.js';
 import { McpServerConfig } from '../types/mcp.js';
 import { LogLevel } from './logger.js';
 // `resolveJsonModule` is enabled in tsconfig. We read package.json so the
@@ -31,6 +32,8 @@ export interface EnvironmentConfig {
     secret?: string;
     integrationCode?: string;
     apiUrl?: string;
+    /** Default Autotask resource to impersonate (AUTOTASK_IMPERSONATION_RESOURCE_ID). */
+    impersonationResourceId?: number;
   };
   server: {
     name: string;
@@ -70,6 +73,11 @@ export interface GatewayCredentials {
    * account. Undefined when absent or not a positive integer.
    */
   impersonationResourceId: number | undefined;
+  /**
+   * Acting Conduit user's verified email, from X-Conduit-Acting-User-Email.
+   * Only trusted on S2S-verified requests; the server drops it otherwise.
+   */
+  actingUserEmail?: string | undefined;
 }
 
 /**
@@ -91,6 +99,10 @@ export function parseImpersonationResourceId(
   return parsed;
 }
 
+// Env-var parse warnings go to stderr (console.error), never stdout, which is
+// the MCP channel in stdio mode.
+const stderrWarn = { warn: (msg: string) => console.error(`[WARN] ${msg}`) };
+
 /**
  * Extract credentials from gateway-injected environment variables
  * The gateway proxies headers as environment variables:
@@ -105,7 +117,8 @@ export function getCredentialsFromGateway(): GatewayCredentials {
     integrationCode: process.env.X_INTEGRATION_CODE || process.env.AUTOTASK_INTEGRATION_CODE,
     apiUrl: process.env.X_API_URL || process.env.AUTOTASK_API_URL,
     impersonationResourceId: parseImpersonationResourceId(
-      process.env.X_IMPERSONATION_RESOURCE_ID || process.env.AUTOTASK_IMPERSONATION_RESOURCE_ID
+      process.env.X_IMPERSONATION_RESOURCE_ID || process.env.AUTOTASK_IMPERSONATION_RESOURCE_ID,
+      stderrWarn
     ),
   };
 }
@@ -114,7 +127,10 @@ export function getCredentialsFromGateway(): GatewayCredentials {
  * Parse credentials from HTTP request headers (for per-request credential handling)
  * Header names follow HTTP convention (lowercase with hyphens)
  */
-export function parseCredentialsFromHeaders(headers: Record<string, string | string[] | undefined>): GatewayCredentials {
+export function parseCredentialsFromHeaders(
+  headers: Record<string, string | string[] | undefined>,
+  logger?: { warn: (msg: string) => void }
+): GatewayCredentials {
   const getHeader = (name: string): string | undefined => {
     const value = headers[name] || headers[name.toLowerCase()];
     return Array.isArray(value) ? value[0] : value;
@@ -125,7 +141,8 @@ export function parseCredentialsFromHeaders(headers: Record<string, string | str
     secret: getHeader('x-api-secret'),
     integrationCode: getHeader('x-integration-code'),
     apiUrl: getHeader('x-api-url'),
-    impersonationResourceId: parseImpersonationResourceId(getHeader('x-impersonation-resource-id')),
+    impersonationResourceId: parseImpersonationResourceId(getHeader('x-impersonation-resource-id'), logger),
+    actingUserEmail: parseActingUserEmail(getHeader(ACTING_USER_EMAIL_HEADER), logger),
   };
 }
 
@@ -146,7 +163,7 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
         secret: process.env.AUTOTASK_SECRET,
         integrationCode: process.env.AUTOTASK_INTEGRATION_CODE,
         apiUrl: process.env.AUTOTASK_API_URL,
-        impersonationResourceId: parseImpersonationResourceId(process.env.AUTOTASK_IMPERSONATION_RESOURCE_ID),
+        impersonationResourceId: parseImpersonationResourceId(process.env.AUTOTASK_IMPERSONATION_RESOURCE_ID, stderrWarn),
       };
 
   // Filter out undefined values to satisfy exactOptionalPropertyTypes
@@ -205,6 +222,19 @@ export function mergeWithMcpConfig(envConfig: EnvironmentConfig, mcpArgs?: Recor
       apiUrl: mcpArgs?.autotask?.apiUrl || envConfig.autotask.apiUrl
     }
   };
+
+  // Carry the env-configured impersonation resource through. Dropping it here
+  // made AUTOTASK_IMPERSONATION_RESOURCE_ID a silent no-op in env mode (#364):
+  // writes ran as the API user with no ImpersonationResourceId header.
+  const impersonationResourceId =
+    parseImpersonationResourceId(
+      mcpArgs?.autotask?.impersonationResourceId !== undefined
+        ? String(mcpArgs.autotask.impersonationResourceId)
+        : undefined
+    ) ?? envConfig.autotask.impersonationResourceId;
+  if (impersonationResourceId !== undefined) {
+    serverConfig.autotask.impersonationResourceId = impersonationResourceId;
+  }
 
   return serverConfig;
 }

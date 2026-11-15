@@ -8,6 +8,12 @@
 
 import { resolveAutotaskApiUrl, invalidateZoneUrlCache } from '../utils/config';
 import { Logger } from '../utils/logger';
+import {
+  impersonationOperation,
+  isImpersonationRejected,
+  markImpersonationRejected,
+  resolveResourceIdByEmail,
+} from './impersonation-resolver';
 
 export interface QueryFilter {
   op: string;
@@ -113,7 +119,14 @@ function parseRetryAfter(headerValue: string | null): number {
  * the zone cache): in gateway mode client instances are per-request, so an
  * instance-level gate would never trip across calls.
  */
-const rateLimitCooldowns = new Map<string, number>();
+const rateLimitCooldowns = new Map<string, Cooldown>();
+
+interface Cooldown {
+  /** When the local gate opens again (Retry-After capped at MAX_COOLDOWN_MS). */
+  gateUntil: number;
+  /** When Autotask said to try again (uncapped Retry-After), reported to callers. */
+  retryAt: number;
+}
 
 /** Cap a bad/hostile Retry-After header so it can't lock a tenant out for long. */
 const MAX_COOLDOWN_MS = 5 * 60 * 1000;
@@ -286,6 +299,37 @@ export function isAutotaskQueryRead(method: string, path: string): boolean {
  * Writes are still not retried here — only idempotent calls are — so a
  * mis-read hourly 429 cannot duplicate a mutation. Callers re-issue writes.
  */
+interface Impersonation {
+  resourceId: number;
+  /** 'explicit' = configured/header ID (strict); 'email' = acting-user lookup (best-effort). */
+  source: 'explicit' | 'email';
+}
+
+/**
+ * Autotask doesn't document a distinct error for "impersonation not allowed",
+ * so classify conservatively:
+ * - 'retry': 4xx (except 429) that is a 403 or mentions impersonation. The
+ *   request was rejected, so re-sending it as the API user can't double-write.
+ * - 'suppress': a 500 whose structured `{"errors":[...]}` body mentions
+ *   impersonation. Autotask doesn't guarantee a 500 wasn't applied, so it is
+ *   never retried; the caller only stops impersonating for that operation.
+ * - false: anything else, including 502/503/504 and unstructured 500s.
+ */
+export function classifyImpersonationRejection(status: number, body: string): 'retry' | 'suppress' | false {
+  if (status === 429 || status < 400) return false;
+  if (status < 500) return status === 403 || /imperson/i.test(body.slice(0, 4000)) ? 'retry' : false;
+  if (status !== 500) return false;
+  try {
+    const parsed = JSON.parse(body) as { errors?: unknown };
+    return Array.isArray(parsed.errors) &&
+      parsed.errors.some((e) => typeof e === 'string' && /imperson/i.test(e))
+      ? 'suppress'
+      : false;
+  } catch {
+    return false;
+  }
+}
+
 export function isIdempotentAutotaskRequest(method: string, path: string): boolean {
   const verb = method.toUpperCase();
   if (verb === 'GET' || verb === 'HEAD' || verb === 'DELETE') return true;
@@ -299,20 +343,23 @@ function threadLimitError(detail: string, retriesUsed: number): AutotaskRateLimi
       : 'Create/update calls are not retried automatically.';
   return new AutotaskRateLimitError(
     `Autotask concurrent thread threshold exceeded (HTTP 429). This call was rejected before Autotask processed it, so it was NOT applied. ${retryNote} ` +
-      `Do not fan out parallel calls; in-flight requests are already capped per tenant. Detail: ${detail}`,
+      `Try again in 1 s. Do not fan out parallel calls; in-flight requests are already capped per tenant. Detail: ${detail}`,
     1,
   );
 }
 
 function assertNotCoolingDown(cooldownKey: string): void {
-  const cooldownUntil = rateLimitCooldowns.get(cooldownKey);
-  if (cooldownUntil === undefined) return;
-  const remainingSeconds = Math.ceil((cooldownUntil - Date.now()) / 1000);
-  if (remainingSeconds > 0) {
+  const cooldown = rateLimitCooldowns.get(cooldownKey);
+  if (cooldown === undefined) return;
+  const now = Date.now();
+  if (cooldown.gateUntil > now) {
+    // The gate uses the capped deadline; the caller is told Autotask's own
+    // (possibly longer) Retry-After.
+    const remainingSeconds = Math.max(1, Math.ceil((Math.max(cooldown.retryAt, cooldown.gateUntil) - now) / 1000));
     throw new AutotaskRateLimitError(
       `Autotask API threshold exceeded (HTTP 429) — this tenant is in a ${remainingSeconds}s cooldown and this call was NOT sent upstream. ` +
         `Do NOT retry until the cooldown passes; retries cannot succeed and querying again immediately only delays recovery. ` +
-        `Wait ${remainingSeconds}s, or ask the user to narrow the workload (smaller date ranges, specific IDs).`,
+        `Try again in ${remainingSeconds} s. Or ask the user to narrow the workload (smaller date ranges, specific IDs).`,
       remainingSeconds,
     );
   }
@@ -352,8 +399,37 @@ export class AutotaskHttpClient {
     private readonly integrationCode: string,
     private readonly apiUrl: string | undefined,
     private readonly logger: Logger,
-    private readonly impersonationResourceId?: number
+    private readonly impersonationResourceId?: number,
+    /**
+     * Verified email of the acting Conduit user (gateway mode, S2S-trusted).
+     * When set and no explicit impersonationResourceId is configured, writes
+     * impersonate the active Autotask resource with that exact email, if
+     * exactly one exists. Reads never impersonate on this path.
+     */
+    private readonly actingUserEmail?: string
   ) {}
+
+  /**
+   * Which resource (if any) this request should impersonate.
+   *
+   * An explicit ID applies to every call (existing contract). An email-derived
+   * ID applies only to writes: impersonation also narrows what queries can see
+   * to the impersonated person's rights, and the goal here is attribution of
+   * notes, time entries and other writes, not changing what reads return.
+   */
+  private async impersonationFor(method: string, path: string): Promise<Impersonation | undefined> {
+    if (this.impersonationResourceId !== undefined) {
+      return { resourceId: this.impersonationResourceId, source: 'explicit' };
+    }
+    if (!this.actingUserEmail) return undefined;
+    const verb = method.toUpperCase();
+    if (verb === 'GET' || verb === 'HEAD' || isAutotaskQueryRead(verb, path)) return undefined;
+    if (isImpersonationRejected(this.username, this.actingUserEmail, impersonationOperation(verb, path))) {
+      return undefined;
+    }
+    const resourceId = await resolveResourceIdByEmail(this, this.username, this.actingUserEmail, this.logger);
+    return resourceId === undefined ? undefined : { resourceId, source: 'email' };
+  }
 
   private async baseUrl(): Promise<string> {
     if (this.resolvedBaseUrl) return this.resolvedBaseUrl;
@@ -363,7 +439,7 @@ export class AutotaskHttpClient {
     return this.resolvedBaseUrl;
   }
 
-  private headers(): Record<string, string> {
+  private headers(impersonation?: Impersonation): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       Accept: 'application/json',
@@ -377,8 +453,8 @@ export class AutotaskHttpClient {
     // body is silently ignored. The impersonated resource must itself have
     // permission for the action, so an impersonated call is the intersection
     // of the API user's rights and the impersonated user's.
-    if (this.impersonationResourceId !== undefined) {
-      headers.ImpersonationResourceId = String(this.impersonationResourceId);
+    if (impersonation !== undefined) {
+      headers.ImpersonationResourceId = String(impersonation.resourceId);
     }
     return headers;
   }
@@ -399,11 +475,22 @@ export class AutotaskHttpClient {
     // Fail before taking a slot when this tenant is already in an hourly
     // cooldown, so a retry storm does not queue behind the in-flight cap.
     assertNotCoolingDown(cooldownKey);
+    // Resolved before taking a slot: an email lookup is itself a request and
+    // must not wait behind the slot this call would be holding.
+    let impersonation = await this.impersonationFor(method, path);
     const release = await acquireTenantSlot(cooldownKey);
     try {
       // A sibling call may have armed the cooldown while we waited.
       assertNotCoolingDown(cooldownKey);
-      return await this.send<T>(method, path, body, { isZoneRetry, threadRetries: 0 });
+      // A sibling write may have rejected email-derived impersonation while
+      // this call waited for a slot. Explicit IDs remain strict.
+      if (
+        impersonation?.source === 'email' && this.actingUserEmail &&
+        isImpersonationRejected(this.username, this.actingUserEmail, impersonationOperation(method, path))
+      ) {
+        impersonation = undefined;
+      }
+      return await this.send<T>(method, path, body, { isZoneRetry, threadRetries: 0, impersonation });
     } finally {
       release();
     }
@@ -413,7 +500,7 @@ export class AutotaskHttpClient {
     method: string,
     path: string,
     body: any,
-    opts: { isZoneRetry: boolean; threadRetries: number },
+    opts: { isZoneRetry: boolean; threadRetries: number; impersonation?: Impersonation | undefined },
   ): Promise<T> {
     const cooldownKey = this.username.toLowerCase();
     const url = path.startsWith('http') ? path : `${await this.baseUrl()}${path.startsWith('/') ? '' : '/'}${path}`;
@@ -424,7 +511,7 @@ export class AutotaskHttpClient {
     try {
       const init: RequestInit = {
         method,
-        headers: this.headers(),
+        headers: this.headers(opts.impersonation),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       };
       if (body !== undefined) {
@@ -455,7 +542,7 @@ export class AutotaskHttpClient {
         );
         this.resolvedBaseUrl = null;
         invalidateZoneUrlCache(this.username);
-        return this.send<T>(method, path, body, { isZoneRetry: true, threadRetries: opts.threadRetries });
+        return this.send<T>(method, path, body, { ...opts, isZoneRetry: true });
       }
       const detail = errorDetail(text);
       if (response.status === 429) {
@@ -486,7 +573,7 @@ export class AutotaskHttpClient {
             );
             await sleepImpl(delay);
             return this.send<T>(method, path, body, {
-              isZoneRetry: opts.isZoneRetry,
+              ...opts,
               threadRetries: opts.threadRetries + 1,
             });
           }
@@ -497,10 +584,11 @@ export class AutotaskHttpClient {
         // Arm the per-tenant cooldown gate so any further calls (including
         // LLM retry-spam and mapping-cache lookups) fail fast locally until
         // the window passes instead of piling onto the throttled tenant.
-        rateLimitCooldowns.set(
-          cooldownKey,
-          Date.now() + Math.min(retryAfter * 1000, MAX_COOLDOWN_MS),
-        );
+        const armedAt = Date.now();
+        rateLimitCooldowns.set(cooldownKey, {
+          gateUntil: armedAt + Math.min(retryAfter * 1000, MAX_COOLDOWN_MS),
+          retryAt: armedAt + retryAfter * 1000,
+        });
         // Single-line message that LLMs will read verbatim — instruct against
         // retry, surface the wait, point at the underlying issue. The structured
         // `retryAfterSeconds` field lets handlers do programmatic things too.
@@ -508,7 +596,7 @@ export class AutotaskHttpClient {
           `Autotask API threshold exceeded (HTTP 429). Do NOT retry this call automatically — ` +
           `the next ${retryAfter}s will likely hit 429 again, and repeated retries can extend the ` +
           `cooldown. Ask the user to scope the query (e.g. narrow date range, filter by company/ticket ID) ` +
-          `or wait ${retryAfter}s before trying again. Detail: ${detail}`,
+          `or wait before trying again. Try again in ${Math.max(1, retryAfter)} s. Detail: ${detail}`,
           retryAfter,
         );
       }
@@ -523,9 +611,43 @@ export class AutotaskHttpClient {
       // Autotask doesn't document a distinct status/body for "impersonation
       // not permitted" specifically, so this can't reliably tell that case
       // apart from any other failure on the same request.
+      // Exception: impersonation derived from the acting user's email is
+      // best-effort by design. Conduit sends that email for every user, and
+      // many tenants never enable impersonation in their security levels, so
+      // a rejection there must not keep failing writes.
+      //   - 'retry': a 4xx rejection. The request was not applied, so it is
+      //     re-sent once as the API user (today's behaviour).
+      //   - 'suppress': a structured 500 that mentions impersonation. Autotask
+      //     doesn't guarantee a 500 wasn't applied, so this call is NOT
+      //     retried (no duplicate-write risk); it fails with a hint, and the
+      //     operation is suppressed so the user's next attempt runs as the
+      //     API user.
+      // Either way only this tenant+user+operation is suppressed.
+      if (opts.impersonation?.source === 'email' && this.actingUserEmail) {
+        const verdict = classifyImpersonationRejection(response.status, text);
+        if (verdict) {
+          markImpersonationRejected(this.username, this.actingUserEmail, impersonationOperation(method, path));
+          if (verdict === 'retry') {
+            this.logger.debug(
+              `Autotask ${method} ${path} rejected acting-user impersonation (HTTP ${response.status}); retrying as the API user`
+            );
+            return this.send<T>(method, path, body, { ...opts, impersonation: undefined });
+          }
+          this.logger.debug(
+            `Autotask ${method} ${path} rejected acting-user impersonation (HTTP ${response.status}); not retrying a 500, suppressed for next attempt`
+          );
+          const err = new Error(
+            `Autotask ${method} ${path} failed: HTTP ${response.status}: ${errorDetail(text)} ` +
+              `(Autotask refused to record this as the acting user. Impersonation is now switched off for this action, ` +
+              `so trying again will record it as the API user. Check first that it wasn't saved.)`
+          );
+          (err as Error & { status?: number }).status = response.status;
+          throw err;
+        }
+      }
       const impersonationHint =
-        this.impersonationResourceId !== undefined
-          ? ` (impersonating resource ${this.impersonationResourceId} - if this is a permissions error, verify that resource's Autotask security level has "Allow impersonation of resources with this security level" enabled, and that its security level permits this specific action)`
+        opts.impersonation !== undefined
+          ? ` (impersonating resource ${opts.impersonation.resourceId} - if this is a permissions error, verify that resource's Autotask security level has "Allow impersonation of resources with this security level" enabled, and that its security level permits this specific action)`
           : '';
       const httpError = new Error(
         `Autotask ${method} ${path} failed: HTTP ${response.status}: ${detail}${impersonationHint}`
