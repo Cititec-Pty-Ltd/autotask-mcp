@@ -2,9 +2,15 @@
 // Handles loading configuration from environment variables and MCP client arguments
 // Supports gateway mode where credentials come via HTTP headers
 
-import { ACTING_USER_EMAIL_HEADER, parseActingUserEmail } from '../services/impersonation-resolver.js';
+import {
+  ACTING_USER_EMAIL_HEADER,
+  IMPERSONATE_ACTING_USER_HEADER,
+  parseActingUserEmail,
+  parseImpersonateActingUser,
+} from '../services/impersonation-resolver.js';
 import { McpServerConfig } from '../types/mcp.js';
 import { LogLevel } from './logger.js';
+import { abortError } from './abort.js';
 // `resolveJsonModule` is enabled in tsconfig. We read package.json so the
 // runtime can report its actual built version in the MCP initialize handshake
 // and the /health endpoint. The Dockerfile patches this file's `version` field
@@ -78,6 +84,12 @@ export interface GatewayCredentials {
    * Only trusted on S2S-verified requests; the server drops it otherwise.
    */
   actingUserEmail?: string | undefined;
+  /**
+   * Per-connection opt-in to acting-user impersonation, from
+   * X-Autotask-Impersonate-Acting-User ("on"/"true"/"1"). Only trusted on
+   * S2S-verified requests; the server ignores it otherwise.
+   */
+  impersonateActingUser?: boolean;
 }
 
 /**
@@ -143,6 +155,8 @@ export function parseCredentialsFromHeaders(
     apiUrl: getHeader('x-api-url'),
     impersonationResourceId: parseImpersonationResourceId(getHeader('x-impersonation-resource-id'), logger),
     actingUserEmail: parseActingUserEmail(getHeader(ACTING_USER_EMAIL_HEADER), logger),
+    // Set only when opted in, so callers comparing parsed credentials see no new key by default.
+    ...(parseImpersonateActingUser(getHeader(IMPERSONATE_ACTING_USER_HEADER)) ? { impersonateActingUser: true } : {}),
   };
 }
 
@@ -289,13 +303,22 @@ const ZONE_DOCS_URL =
  *
  * Intentionally uses native `fetch` (not the autotask-node SDK) because
  * this is a pre-auth bootstrap: the SDK needs a URL to construct itself.
+ *
+ * `opts.signal` (optional) cancels this caller's zone fetch: an aborted signal
+ * throws an AbortError before any network call, and an abort mid-lookup throws
+ * an AbortError without logging an error or writing the cache. Explicit URLs
+ * and cache hits return immediately regardless of the signal. There is
+ * deliberately no shared in-flight promise: every uncached caller does its own
+ * fetch, so one caller's signal can never cancel another caller's lookup.
  */
 export async function resolveAutotaskApiUrl(
   username: string | undefined,
   explicitApiUrl: string | undefined,
   logger: ZoneResolverLogger,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  opts?: { signal?: AbortSignal | undefined }
 ): Promise<string> {
+  const signal = opts?.signal;
   if (explicitApiUrl) {
     return explicitApiUrl;
   }
@@ -313,14 +336,18 @@ export async function resolveAutotaskApiUrl(
     return cached;
   }
 
+  if (signal?.aborted) throw abortError('Autotask zone lookup aborted');
+
   const lookupUrl = `${ZONE_INFO_URL}?user=${encodeURIComponent(username)}`;
   let response: Response;
   try {
     response = await fetchImpl(lookupUrl, {
       method: 'GET',
-      headers: { Accept: 'application/json' }
+      headers: { Accept: 'application/json' },
+      ...(signal ? { signal } : {})
     });
   } catch (err) {
+    if (signal?.aborted) throw abortError('Autotask zone lookup aborted');
     const message = err instanceof Error ? err.message : String(err);
     logger.error(
       `Failed to contact Autotask zone info endpoint: ${message}. ` +
@@ -348,6 +375,7 @@ export async function resolveAutotaskApiUrl(
   try {
     body = await response.json();
   } catch (err) {
+    if (signal?.aborted) throw abortError('Autotask zone lookup aborted');
     logger.error(
       `Autotask zone info response was not valid JSON. ` +
         `Set AUTOTASK_API_URL manually — see ${ZONE_DOCS_URL}`
@@ -358,6 +386,8 @@ export async function resolveAutotaskApiUrl(
       { cause: err }
     );
   }
+
+  if (signal?.aborted) throw abortError('Autotask zone lookup aborted');
 
   const url: unknown = body?.url;
   if (typeof url !== 'string' || url.length === 0) {

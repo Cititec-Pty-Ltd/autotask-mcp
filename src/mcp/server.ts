@@ -23,6 +23,7 @@ import { AutotaskService } from '../services/autotask.service.js';
 import { Logger } from '../utils/logger.js';
 import { McpServerConfig } from '../types/mcp.js';
 import { EnvironmentConfig, parseCredentialsFromHeaders, GatewayCredentials, getServerVersion } from '../utils/config.js';
+import { isActingUserImpersonationEnabled } from '../services/impersonation-resolver.js';
 import { AutotaskResourceHandler } from '../handlers/resource.handler.js';
 import { AutotaskToolHandler } from '../handlers/tool.handler.js';
 import { registerPromptHandlers } from './prompts.js';
@@ -107,7 +108,15 @@ export class AutotaskMcpServer {
           Object.fromEntries(ctx.requestInfo.headers) as Record<string, string | undefined>,
           this.logger
         );
-        if (!trustActingUserEmail) delete credentials.actingUserEmail;
+        // Acting-user impersonation is opt-in: either for every tenant
+        // (AUTOTASK_IMPERSONATE_ACTING_USER) or per connection
+        // (X-Autotask-Impersonate-Acting-User, set by Conduit from the
+        // connection's stored settings). Conduit sends the email for every
+        // user, and most tenants' API users can't impersonate, so defaulting
+        // it on broke their note writes. Both are trusted only after S2S.
+        const optedIn = isActingUserImpersonationEnabled() || credentials.impersonateActingUser === true;
+        if (!trustActingUserEmail || !optedIn) delete credentials.actingUserEmail;
+        delete credentials.impersonateActingUser;
       } else if (ctx.requestInfo && allowEnvImpersonationHeader) {
         // Env mode over HTTP: the server is bound to one tenant's env
         // credentials, so a per-request X-Impersonation-Resource-Id can safely
@@ -442,7 +451,17 @@ export class AutotaskMcpServer {
     });
 
     this.httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
-      const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+      // Only the path is used, so parse against a fixed base rather than the
+      // client-supplied Host header. A target that still cannot be parsed (e.g. "//")
+      // must answer 400, never throw out of the listener.
+      let url: URL;
+      try {
+        url = new URL(req.url || '/', 'http://localhost');
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Bad request' }));
+        return;
+      }
 
       // CORS headers applied to every response so browser-based MCP clients
       // (e.g. claude.ai custom connectors) can reach the server. '*' is safe
