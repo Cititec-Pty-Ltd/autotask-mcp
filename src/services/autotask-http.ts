@@ -8,6 +8,7 @@
 
 import { resolveAutotaskApiUrl, invalidateZoneUrlCache } from '../utils/config';
 import { Logger } from '../utils/logger';
+import { abortError as makeAbortError, isAbortError, withTimeout } from '../utils/abort';
 import {
   impersonationOperation,
   isImpersonationRejected,
@@ -39,6 +40,71 @@ interface QueryResponse<T> {
 }
 
 const RAW_REQUEST_METHODS = ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'] as const;
+
+/**
+ * Autotask REST entity names the usage log may print verbatim. Anything not
+ * on this list (or the verb list below) is collapsed to `:x`, so free text,
+ * ids, ticket numbers, emails and names never reach the logs.
+ */
+const RAW_LOG_ENTITIES = new Set<string>([
+  'ActionTypes', 'AllocationCodes', 'Appointments', 'BillingCodes', 'BillingItems',
+  'ChangeRequestLinks', 'ChecklistLibraries', 'ClassificationIcons', 'Companies',
+  'CompanyAlerts', 'CompanyAttachments', 'CompanyLocations', 'CompanyNotes',
+  'CompanySiteConfigurations', 'CompanyTeams', 'CompanyToDos', 'ConfigurationItemCategories',
+  'ConfigurationItemNotes', 'ConfigurationItemTypes', 'ConfigurationItems', 'ContactGroups',
+  'Contacts', 'ContractBlocks', 'ContractCharges', 'ContractExclusionBillingCodes',
+  'ContractMilestones', 'ContractNotes', 'ContractRates', 'ContractServices', 'Contracts',
+  'Countries', 'Currencies', 'Departments', 'ExpenseItems', 'ExpenseReports', 'Holidays',
+  'HolidaySets', 'InternalLocations', 'InventoryItems', 'InventoryLocations', 'InvoiceTemplates',
+  'Invoices', 'Modules', 'Notes', 'NotificationHistory', 'Opportunities', 'OrganizationalLevel1s',
+  'OrganizationalLevel2s', 'OrganizationalLevelAssociations', 'PaymentTerms', 'Phases',
+  'PriceListProducts', 'PriceListServices', 'Products', 'ProjectCharges', 'ProjectNotes',
+  'Projects', 'PurchaseOrderItems', 'PurchaseOrders', 'QuoteItems', 'QuoteLocations', 'Quotes',
+  'ResourceRoles', 'ResourceServiceDeskRoles', 'Resources', 'Roles', 'SalesOrders',
+  'ServiceBundles', 'ServiceCallTaskResources', 'ServiceCallTasks', 'ServiceCallTicketResources',
+  'ServiceCallTickets', 'ServiceCalls', 'ServiceLevelAgreementResults', 'Services', 'Skills',
+  'Subscriptions', 'SurveyResults', 'TaskNotes', 'TaskSecondaryResources', 'Tasks', 'Taxes',
+  'TicketAdditionalConfigurationItems', 'TicketAdditionalContacts', 'TicketAttachments',
+  'TicketCategories', 'TicketChangeRequestApprovals', 'TicketChecklistItems', 'TicketCharges',
+  'TicketHistory', 'TicketNotes', 'TicketRmaCredits', 'TicketSecondaryResources', 'Tickets',
+  'TimeEntries', 'TimeOffRequests', 'UserDefinedFieldDefinitions', 'Version', 'WorkTypeModifiers',
+  'ZoneInformation',
+]);
+
+/** Fixed verb/metadata segments that follow an entity in the REST API. */
+const RAW_LOG_VERBS = new Set<string>([
+  'query', 'count', 'entityInformation', 'fields', 'userDefinedFields', 'picklist',
+]);
+
+/**
+ * Reduce a raw-request path to an allowlisted endpoint shape for usage
+ * logging, e.g. `/Tickets/123/Notes?x=1` -> `/Tickets/:x/Notes`. Only known
+ * entity names and fixed verbs are printed; every other segment becomes
+ * `:x`. Control characters and ';' are stripped first, and %-encoded paths
+ * are decoded (or collapsed entirely if decoding fails).
+ */
+export function rawRequestPathShape(path: string): string {
+  let p = String(path).split('?')[0].split('#')[0];
+  // eslint-disable-next-line no-control-regex
+  p = p.replace(/[\u0000-\u001f\u007f;]/g, '');
+  if (p.includes('%')) {
+    try {
+      p = decodeURIComponent(p);
+    } catch {
+      return '/:x';
+    }
+    // eslint-disable-next-line no-control-regex
+    p = p.replace(/[\u0000-\u001f\u007f;]/g, '');
+  }
+  const segs = p.split('/').filter((seg) => seg.length > 0);
+  if (segs.length === 0) return '/';
+  const out = segs.slice(0, 8).map((seg, i) => {
+    if (RAW_LOG_ENTITIES.has(seg)) return seg;
+    if (i > 0 && RAW_LOG_VERBS.has(seg)) return seg;
+    return ':x';
+  });
+  return '/' + out.join('/');
+}
 
 /**
  * Maximum value Autotask accepts for the per-page `MaxRecords` body param on
@@ -193,7 +259,17 @@ function semaphoreFor(key: string): TenantSemaphore {
   return sem;
 }
 
-async function acquireTenantSlot(key: string): Promise<() => void> {
+function abortError(method: string, path: string): Error {
+  return makeAbortError(`Autotask ${method} ${path} aborted`);
+}
+
+// Re-exported so existing importers keep working.
+export { isAbortError };
+
+async function acquireTenantSlot(key: string, signal?: AbortSignal, onAbort?: () => Error): Promise<() => void> {
+  // Already cancelled (e.g. aborted while suspended on impersonation lookup):
+  // never take or queue a slot.
+  if (signal?.aborted) throw onAbort ? onAbort() : new Error('aborted');
   const sem = semaphoreFor(key);
   let released = false;
   const release = (): void => {
@@ -212,8 +288,24 @@ async function acquireTenantSlot(key: string): Promise<() => void> {
     return release;
   }
 
-  await new Promise<void>((resolve) => {
-    sem.waiters.push(resolve);
+  await new Promise<void>((resolve, reject) => {
+    if (!signal) {
+      sem.waiters.push(resolve);
+      return;
+    }
+    const abort = (): void => {
+      // Already resumed means the slot was handed to us; the caller releases.
+      const idx = sem.waiters.indexOf(resume);
+      if (idx === -1) return;
+      sem.waiters.splice(idx, 1);
+      reject(onAbort ? onAbort() : new Error('aborted'));
+    };
+    const resume = (): void => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    };
+    sem.waiters.push(resume);
+    signal.addEventListener('abort', abort, { once: true });
   });
   return release;
 }
@@ -326,10 +418,14 @@ export function classifyImpersonationRejection(status: number, body: string): 'r
   if (status !== 500) return false;
   try {
     const parsed = JSON.parse(body) as { errors?: unknown };
-    return Array.isArray(parsed.errors) &&
-      parsed.errors.some((e) => typeof e === 'string' && /imperson/i.test(e))
-      ? 'suppress'
-      : false;
+    if (!Array.isArray(parsed.errors)) return false;
+    const errors = parsed.errors.filter((e): e is string => typeof e === 'string');
+    // Autotask answers an impersonated write the resource may not make with a
+    // structured 500 "The logged in Resource does not have the adequate
+    // permissions to create this entity type." That is a permission check, so
+    // nothing was written and re-sending as the API user is safe.
+    if (errors.some((e) => /does not have the adequate permissions/i.test(e))) return 'retry';
+    return errors.some((e) => /imperson/i.test(e)) ? 'suppress' : false;
   } catch {
     return false;
   }
@@ -436,9 +532,9 @@ export class AutotaskHttpClient {
     return resourceId === undefined ? undefined : { resourceId, source: 'email' };
   }
 
-  private async baseUrl(): Promise<string> {
+  private async baseUrl(signal?: AbortSignal): Promise<string> {
     if (this.resolvedBaseUrl) return this.resolvedBaseUrl;
-    const url = await resolveAutotaskApiUrl(this.username, this.apiUrl, this.logger);
+    const url = await resolveAutotaskApiUrl(this.username, this.apiUrl, this.logger, fetch, { signal });
     // Normalize: strip trailing slashes and append /v1.0 root.
     this.resolvedBaseUrl = `${url.replace(/\/+$/, '')}/v1.0`;
     return this.resolvedBaseUrl;
@@ -475,15 +571,16 @@ export class AutotaskHttpClient {
    * through `send()` and do not acquire a second slot — re-entering
    * `request()` here would deadlock when every slot is already taken.
    */
-  private async request<T>(method: string, path: string, body?: any, isZoneRetry = false): Promise<T> {
+  private async request<T>(method: string, path: string, body?: any, isZoneRetry = false, signal?: AbortSignal): Promise<T> {
     const cooldownKey = this.username.toLowerCase();
+    if (signal?.aborted) throw abortError(method, path);
     // Fail before taking a slot when this tenant is already in an hourly
     // cooldown, so a retry storm does not queue behind the in-flight cap.
     assertNotCoolingDown(cooldownKey);
     // Resolved before taking a slot: an email lookup is itself a request and
     // must not wait behind the slot this call would be holding.
     let impersonation = await this.impersonationFor(method, path);
-    const release = await acquireTenantSlot(cooldownKey);
+    const release = await acquireTenantSlot(cooldownKey, signal, () => abortError(method, path));
     try {
       // A sibling call may have armed the cooldown while we waited.
       assertNotCoolingDown(cooldownKey);
@@ -495,7 +592,7 @@ export class AutotaskHttpClient {
       ) {
         impersonation = undefined;
       }
-      return await this.send<T>(method, path, body, { isZoneRetry, threadRetries: 0, impersonation });
+      return await this.send<T>(method, path, body, { isZoneRetry, threadRetries: 0, impersonation, signal });
     } finally {
       release();
     }
@@ -505,10 +602,12 @@ export class AutotaskHttpClient {
     method: string,
     path: string,
     body: any,
-    opts: { isZoneRetry: boolean; threadRetries: number; impersonation?: Impersonation | undefined },
+    opts: { isZoneRetry: boolean; threadRetries: number; impersonation?: Impersonation | undefined; signal?: AbortSignal | undefined },
   ): Promise<T> {
     const cooldownKey = this.username.toLowerCase();
-    const url = path.startsWith('http') ? path : `${await this.baseUrl()}${path.startsWith('/') ? '' : '/'}${path}`;
+    const url = path.startsWith('http') ? path : `${await this.baseUrl(opts.signal)}${path.startsWith('/') ? '' : '/'}${path}`;
+    // An abort during zone resolution must not start the request.
+    if (opts.signal?.aborted) throw abortError(method, path);
 
     this.logger.debug(`Autotask HTTP ${method} ${url}`);
 
@@ -517,13 +616,16 @@ export class AutotaskHttpClient {
       const init: RequestInit = {
         method,
         headers: this.headers(opts.impersonation),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: opts.signal
+          ? withTimeout(opts.signal, REQUEST_TIMEOUT_MS)
+          : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       };
       if (body !== undefined) {
         init.body = JSON.stringify(body);
       }
       response = await fetch(url, init);
     } catch (err) {
+      if (opts.signal?.aborted) throw abortError(method, path);
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`Autotask ${method} ${url} network error: ${msg}`, { cause: err });
     }
@@ -533,6 +635,9 @@ export class AutotaskHttpClient {
     }
 
     const text = await response.text().catch(() => '');
+    // An abort while reading the body leaves text '' — don't let that pass as
+    // an empty success (it would cache empty field info).
+    if (opts.signal?.aborted) throw abortError(method, path);
 
     if (!response.ok) {
       // A 401 against a relative (zone-resolved) path — as opposed to an
@@ -576,10 +681,13 @@ export class AutotaskHttpClient {
               `Autotask ${method} ${path} hit the concurrent thread threshold — ` +
                 `retry ${opts.threadRetries + 1}/${THREAD_LIMIT_MAX_RETRIES} in ${delay}ms (no tenant cooldown)`
             );
+            if (opts.signal?.aborted) throw abortError(method, path);
             await sleepImpl(delay);
+            if (opts.signal?.aborted) throw abortError(method, path);
             return this.send<T>(method, path, body, {
               ...opts,
               threadRetries: opts.threadRetries + 1,
+              signal: opts.signal,
             });
           }
           throw threadLimitError(detail, opts.threadRetries);
@@ -689,6 +797,9 @@ export class AutotaskHttpClient {
       throw new Error(`Autotask rawRequest: method must be one of ${RAW_REQUEST_METHODS.join(', ')}`);
     }
     assertSafeRelativePath(path);
+    // Usage signal only: method + endpoint shape. IDs, query strings and
+    // bodies are dropped so no customer data reaches the logs.
+    this.logger.info(`Autotask raw request ${upperMethod} ${rawRequestPathShape(path)}`);
 
     let finalPath = path;
     if (queryParams && Object.keys(queryParams).length > 0) {
@@ -847,10 +958,13 @@ export class AutotaskHttpClient {
   /**
    * GET /{Entity}/entityInformation/fields — returns the raw { fields: [...] } shape.
    */
-  async fieldInfo(entity: string): Promise<{ fields: any[] }> {
+  async fieldInfo(entity: string, opts?: { signal?: AbortSignal }): Promise<{ fields: any[] }> {
     const res = await this.request<{ fields?: any[]; items?: any[] }>(
       'GET',
-      `/${entity}/entityInformation/fields`
+      `/${entity}/entityInformation/fields`,
+      undefined,
+      false,
+      opts?.signal
     );
     return { fields: res?.fields || res?.items || [] };
   }
