@@ -16,6 +16,12 @@
 - **v2.41.1: fix.** Acting-user impersonation is opt-in (`AUTOTASK_IMPERSONATE_ACTING_USER`), and that 500 retries once as the API user (#384).
 - **v2.42.0: per-connection opt-in.** `X-Autotask-Impersonate-Acting-User: on`, trusted only after `X-Gateway-S2S` verifies (#385).
 
+### Fixed
+
+- **`autotask_create_ticket` read-back is bounded by a 5-second deadline.** The read-back after a create (the ticket, then the queue and status labels) inherited the HTTP client's 60-second timeout per request, so a slow Autotask API could hold the success response past a client's tool-call timeout and invite a retry of a create that had already succeeded (a duplicate ticket). The whole read-back now has one 5-second, cancellable deadline, the budget `autotask_get_company` uses for its labels. On expiry the requests are aborted and the call returns the created ID with `the ticket number could not be read back (timed out)`.
+
+- **`queueID: null` is valid in the `autotask_create_ticket` schema.** With `AUTOTASK_DEFAULT_QUEUE_ID` set, `null` is the way to create a ticket without the default queue, but the schema allowed only a number, so schema-validating clients rejected it. `queueID` is now `type: ["number", "null"]` (still optional), and the static description says what `null` does.
+
 ### Added
 
 - **Readable create results.** After `autotask_create_ticket` succeeds, the server reads the ticket back and the message names it the way people do: `Created ticket T20261124.0135 (ID 441588) in Level II Support: "Printer offline", status New` (queue and status labels from the picklist cache, falling back to the IDs). `data` is still the numeric ID; the read-back is a new `ticket` field (`id`, `ticketNumber`, `title`, `queueID`, `queue`, `statusID`, `status`). If the read-back fails, the call still succeeds with the ID and says the ticket number could not be read back: a created ticket is never reported as failed. `autotask_create_contact` now says `Created contact Jane Doe (ID 77)` (from its arguments, no extra call) and `autotask_create_ticket_note` names the ticket ID.
