@@ -42,6 +42,8 @@ export interface EnvironmentConfig {
     impersonationResourceId?: number;
     /** Queue for autotask_create_ticket when the caller omits queueID (AUTOTASK_DEFAULT_QUEUE_ID). */
     defaultQueueId?: number;
+    /** Work type (billing code) for autotask_create_ticket when the caller omits billingCodeID (AUTOTASK_DEFAULT_BILLING_CODE_ID). */
+    defaultBillingCodeId?: number;
   };
   server: {
     name: string;
@@ -134,6 +136,26 @@ export function parseDefaultQueueId(raw: string | undefined): number | undefined
   return parsed;
 }
 
+/**
+ * Parse AUTOTASK_DEFAULT_BILLING_CODE_ID, the work type (billing code)
+ * autotask_create_ticket uses when the caller gives no billingCodeID. Same
+ * rules as AUTOTASK_DEFAULT_QUEUE_ID: unset or empty means no default, and
+ * anything else must be a positive integer written in digits, or it throws.
+ */
+export function parseDefaultBillingCodeId(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const value = String(raw).trim();
+  if (value === '') return undefined;
+  const parsed = Number(value);
+  if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `Invalid AUTOTASK_DEFAULT_BILLING_CODE_ID: ${JSON.stringify(raw)}. It must be a positive integer ` +
+        '(an Autotask work type / billing code ID, see autotask_list_billing_codes), or unset for no default work type.'
+    );
+  }
+  return parsed;
+}
+
 // Env-var parse warnings go to stderr (console.error), never stdout, which is
 // the MCP channel in stdio mode.
 const stderrWarn = { warn: (msg: string) => console.error(`[WARN] ${msg}`) };
@@ -211,6 +233,7 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
     apiUrl?: string;
     impersonationResourceId?: number;
     defaultQueueId?: number;
+    defaultBillingCodeId?: number;
   } = {};
   if (creds.username) autotaskConfig.username = creds.username;
   if (creds.secret) autotaskConfig.secret = creds.secret;
@@ -221,6 +244,10 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
   // applies it only in env mode: a queue ID belongs to one tenant.
   const defaultQueueId = parseDefaultQueueId(process.env.AUTOTASK_DEFAULT_QUEUE_ID);
   if (defaultQueueId !== undefined) autotaskConfig.defaultQueueId = defaultQueueId;
+  // Same for the default work type: validated here, applied in env mode only,
+  // because a billing code ID belongs to one tenant too.
+  const defaultBillingCodeId = parseDefaultBillingCodeId(process.env.AUTOTASK_DEFAULT_BILLING_CODE_ID);
+  if (defaultBillingCodeId !== undefined) autotaskConfig.defaultBillingCodeId = defaultBillingCodeId;
 
   const transportType = (process.env.MCP_TRANSPORT as TransportType) || 'stdio';
   if (transportType !== 'stdio' && transportType !== 'http') {
@@ -458,6 +485,7 @@ When AUTH_MODE=gateway, credentials are injected by the MCP Gateway:
 === Common Options ===
   AUTOTASK_API_URL         - Autotask API base URL (auto-detected if not provided)
   AUTOTASK_DEFAULT_QUEUE_ID - Env mode only. Queue ID that autotask_create_ticket uses when queueID is omitted (an explicit queueID always wins). Must be a positive integer; anything else stops the server at startup.
+  AUTOTASK_DEFAULT_BILLING_CODE_ID - Env mode only. Work type (billing code) ID that autotask_create_ticket uses when billingCodeID is omitted (an explicit billingCodeID always wins). Must be a positive integer; anything else stops the server at startup.
   AUTH_MODE                - Authentication mode: env (default), gateway
   MCP_SERVER_NAME          - Server name (default: autotask-mcp)
   MCP_SERVER_VERSION       - Override the reported server version. Defaults to the version baked into the image's package.json at build time. Useful for stamping a custom build identifier.

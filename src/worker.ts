@@ -34,6 +34,7 @@ import { Logger } from './utils/logger.js';
 import {
   getServerVersion,
   parseCredentialsFromHeaders,
+  parseDefaultBillingCodeId,
   parseDefaultQueueId,
   parseImpersonationResourceId,
 } from './utils/config.js';
@@ -46,6 +47,7 @@ export interface Env {
   AUTOTASK_API_URL?: string;
   AUTOTASK_IMPERSONATION_RESOURCE_ID?: string;
   AUTOTASK_DEFAULT_QUEUE_ID?: string;
+  AUTOTASK_DEFAULT_BILLING_CODE_ID?: string;
   AUTH_MODE?: string;
   LOG_LEVEL?: string;
   LOG_FORMAT?: string;
@@ -118,9 +120,18 @@ function getAppServer(env: Env): AutotaskMcpServer {
   // Throws on a malformed value, like the Node entry point (the server
   // applies it in env mode only).
   const defaultQueueId = parseDefaultQueueId(env.AUTOTASK_DEFAULT_QUEUE_ID);
+  // The default work type is tenant-specific and never used in gateway mode,
+  // so it is not even parsed there: a stale value cannot fail requests.
+  const defaultBillingCodeId = env.AUTH_MODE === 'gateway'
+    ? undefined
+    : parseDefaultBillingCodeId(env.AUTOTASK_DEFAULT_BILLING_CODE_ID);
 
   appServer = new AutotaskMcpServer(config, logger, {
-    autotask: defaultQueueId !== undefined ? { ...autotask, defaultQueueId } : autotask,
+    autotask: {
+      ...autotask,
+      ...(defaultQueueId !== undefined && { defaultQueueId }),
+      ...(defaultBillingCodeId !== undefined && { defaultBillingCodeId }),
+    },
     server: { name: 'autotask-mcp', version: getServerVersion() },
     transport: { type: 'http', port: 8080, host: '0.0.0.0' },
     logging: {

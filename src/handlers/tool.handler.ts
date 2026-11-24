@@ -175,17 +175,19 @@ export class AutotaskToolHandler {
   private lazyLoading: boolean;
   private enhanceConcurrency: number;
   private defaultQueueId: number | undefined;
+  private defaultBillingCodeId: number | undefined;
 
   constructor(
     autotaskService: AutotaskService,
     logger: Logger,
     lazyLoading = false,
-    options: { defaultQueueId?: number | undefined } = {}
+    options: { defaultQueueId?: number | undefined; defaultBillingCodeId?: number | undefined } = {}
   ) {
     this.autotaskService = autotaskService;
     this.logger = logger;
     this.lazyLoading = lazyLoading;
     this.defaultQueueId = options.defaultQueueId;
+    this.defaultBillingCodeId = options.defaultBillingCodeId;
     this.enhanceConcurrency = resolveEnhanceConcurrency(process.env.AUTOTASK_ENHANCE_CONCURRENCY);
     this.picklistCache = new PicklistCache(
       logger,
@@ -1222,6 +1224,10 @@ export class AutotaskToolHandler {
         // queueID at all. An explicit queueID, including null, always wins.
         const usedDefaultQueue = payload.queueID === undefined && this.defaultQueueId !== undefined;
         if (usedDefaultQueue) payload.queueID = this.defaultQueueId;
+        // AUTOTASK_DEFAULT_BILLING_CODE_ID (env mode): the same rule for the
+        // work type. An explicit billingCodeID, including null, always wins.
+        const usedDefaultWorkType = payload.billingCodeID === undefined && this.defaultBillingCodeId !== undefined;
+        if (usedDefaultWorkType) payload.billingCodeID = this.defaultBillingCodeId;
         await this.fillAssignedResourceRole(payload, a.assignedResourceRoleName);
         const id = await s.createTicket(payload);
         // The ticket exists from here on: the read-back is best-effort and
@@ -1229,10 +1235,13 @@ export class AutotaskToolHandler {
         const created = await this.describeCreatedTicket(id);
         const where = created.queue ? ` in ${created.queue}` : '';
         const dflt = usedDefaultQueue ? ' (the default queue)' : '';
+        const workType = usedDefaultWorkType
+          ? `, with the default work type (billingCodeID ${this.defaultBillingCodeId})`
+          : '';
         const message = created.ticketNumber
           ? `Created ticket ${created.ticketNumber} (ID ${id})${where}${dflt}` +
-            `${created.title ? `: "${created.title}"` : ''}${created.status ? `, status ${created.status}` : ''}`
-          : `Created ticket with ID ${id}${usedDefaultQueue ? ` in the default queue (queueID ${this.defaultQueueId})` : ''}; ` +
+            `${created.title ? `: "${created.title}"` : ''}${created.status ? `, status ${created.status}` : ''}${workType}`
+          : `Created ticket with ID ${id}${usedDefaultQueue ? ` in the default queue (queueID ${this.defaultQueueId})` : ''}${workType}; ` +
             `the ticket number could not be read back${created.error ? ` (${created.error})` : ''}`;
         // data stays the numeric ID (backward compatible); the read-back is
         // an extra `ticket` field.
@@ -1815,6 +1824,29 @@ export class AutotaskToolHandler {
       ['autotask_list_ticket_statuses', async () => {
         const statuses = await this.picklistCache.getTicketStatuses();
         return { result: statuses.map(s => ({ id: s.value, name: s.label, isActive: s.isActive })), message: `Found ${statuses.length} ticket statuses` };
+      }],
+      ['autotask_list_billing_codes', async (a) => {
+        const codes = await s.searchBillingCodes({
+          name: typeof a.name === 'string' && a.name.trim() !== '' ? a.name.trim() : undefined,
+          isActive: a.isActive === undefined ? true : a.isActive,
+          useType: typeof a.useType === 'number' ? a.useType : undefined,
+        });
+        // Best-effort label for useType; a failed lookup never fails the list.
+        let useTypeLabels = new Map<string, string>();
+        try {
+          const values = await this.picklistCache.getPicklistValues('BillingCodes', 'useType');
+          useTypeLabels = new Map(values.map(v => [String(v.value), v.label]));
+        } catch (error) {
+          this.logger.debug('Could not load BillingCodes.useType labels:', error);
+        }
+        const result = codes.map(c => ({
+          id: c.id,
+          name: c.name,
+          useType: c.useType,
+          ...(useTypeLabels.has(String(c.useType)) && { useTypeName: useTypeLabels.get(String(c.useType)) }),
+          isActive: c.isActive,
+        }));
+        return { result, message: `Found ${result.length} billing codes` };
       }],
       ['autotask_list_ticket_priorities', async () => {
         const priorities = await this.picklistCache.getTicketPriorities();

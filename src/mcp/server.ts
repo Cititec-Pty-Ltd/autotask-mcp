@@ -55,6 +55,7 @@ export class AutotaskMcpServer {
   private stdioHandle: StdioServerHandle | undefined;
   private lazyLoading: boolean;
   private defaultQueueId: number | undefined;
+  private defaultBillingCodeId: number | undefined;
 
   constructor(config: McpServerConfig, logger: Logger, envConfig?: EnvironmentConfig) {
     this.logger = logger;
@@ -76,11 +77,23 @@ export class AutotaskMcpServer {
     } else {
       this.defaultQueueId = configuredQueueId;
     }
+    // AUTOTASK_DEFAULT_BILLING_CODE_ID: same rule, a work type ID is
+    // tenant-specific too.
+    const configuredBillingCodeId = envConfig?.autotask?.defaultBillingCodeId;
+    if (envConfig?.auth?.mode === 'gateway') {
+      if (configuredBillingCodeId !== undefined) {
+        logger.warn('AUTOTASK_DEFAULT_BILLING_CODE_ID is ignored in gateway mode (billing code IDs are tenant-specific).');
+      }
+      this.defaultBillingCodeId = undefined;
+    } else {
+      this.defaultBillingCodeId = configuredBillingCodeId;
+    }
 
     // Initialize handlers
     this.resourceHandler = new AutotaskResourceHandler(this.autotaskService, logger);
     this.toolHandler = new AutotaskToolHandler(this.autotaskService, logger, this.lazyLoading, {
       defaultQueueId: this.defaultQueueId,
+      defaultBillingCodeId: this.defaultBillingCodeId,
     });
   }
 
@@ -248,6 +261,7 @@ export class AutotaskMcpServer {
       // undefined in gateway mode (see the constructor).
       toolHandler: new AutotaskToolHandler(service, this.logger, this.lazyLoading, {
         defaultQueueId: this.defaultQueueId,
+        defaultBillingCodeId: this.defaultBillingCodeId,
       }),
     };
   }
@@ -664,7 +678,7 @@ Use autotask_list_categories to discover available tool categories, then autotas
 - Utility: test connection
 
 ## Picklist Discovery:
-Use autotask_list_queues, autotask_list_ticket_statuses, or autotask_list_ticket_priorities to discover valid IDs before filtering. Use autotask_get_field_info for any entity's field definitions and picklist values.
+Use autotask_list_queues, autotask_list_ticket_statuses, or autotask_list_ticket_priorities to discover valid IDs before filtering. Use autotask_list_billing_codes to find work type (billing code) IDs. Use autotask_get_field_info for any entity's field definitions and picklist values.
 
 ## ID-to-Name Mapping:
 All search and detail tools automatically include human-readable names for company and resource IDs in an _enhanced field on each result.

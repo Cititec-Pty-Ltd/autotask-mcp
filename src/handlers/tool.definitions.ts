@@ -635,8 +635,8 @@ export const TOOL_DEFINITIONS: McpTool[] = [
           description: 'Ticket source ID (picklist, e.g. Phone, Email, Portal). Use autotask_get_field_info (entityType "Tickets", fieldName "source") to discover valid values.'
         },
         billingCodeID: {
-          type: 'number',
-          description: 'Work type / billing code ID used for billing this ticket.'
+          type: ['number', 'null'],
+          description: 'Work type / billing code ID used for billing this ticket. Use autotask_list_billing_codes to discover valid IDs. If omitted, the server\'s configured default work type is used, if any. Pass null to create the ticket without a work type, even when a default is configured.'
         },
         serviceLevelAgreementID: {
           type: 'number',
@@ -2754,6 +2754,29 @@ export const TOOL_DEFINITIONS: McpTool[] = [
     }
   },
   {
+    name: 'autotask_list_billing_codes',
+    description: 'List Autotask billing codes, including work types (the billingCodeID on tickets and time entries). Returns id, name, useType (with its label when known) and isActive. Active codes only by default.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Optional: only codes whose name contains this text, e.g. "Remote".'
+        },
+        isActive: {
+          type: ['boolean', 'null'],
+          description: 'true (default) = active codes only, false = inactive only, null = all.'
+        },
+        useType: {
+          type: 'number',
+          description: 'Optional: only codes with this BillingCodes.useType value. Use autotask_get_field_info (entityType "BillingCodes", fieldName "useType") for the values.'
+        }
+      },
+      required: []
+    },
+    annotations: { readOnlyHint: true }
+  },
+  {
     name: 'autotask_list_ticket_priorities',
     description: 'List all available ticket priorities in Autotask. Use this to find priority values for filtering or creating tickets.',
     inputSchema: {
@@ -3438,7 +3461,7 @@ export const TOOL_DEFINITIONS: McpTool[] = [
 export const TOOL_CATEGORIES: Record<string, { description: string; tools: string[] }> = {
   utility: {
     description: 'Connection testing and field/picklist discovery',
-    tools: ['autotask_test_connection', 'autotask_list_queues', 'autotask_list_ticket_statuses', 'autotask_list_ticket_priorities', 'autotask_get_field_info']
+    tools: ['autotask_test_connection', 'autotask_list_queues', 'autotask_list_ticket_statuses', 'autotask_list_ticket_priorities', 'autotask_list_billing_codes', 'autotask_get_field_info']
   },
   companies: {
     description: 'Search, create, and update companies',
