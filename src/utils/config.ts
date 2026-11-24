@@ -244,10 +244,17 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
   // applies it only in env mode: a queue ID belongs to one tenant.
   const defaultQueueId = parseDefaultQueueId(process.env.AUTOTASK_DEFAULT_QUEUE_ID);
   if (defaultQueueId !== undefined) autotaskConfig.defaultQueueId = defaultQueueId;
-  // Same for the default work type: validated here, applied in env mode only,
-  // because a billing code ID belongs to one tenant too.
-  const defaultBillingCodeId = parseDefaultBillingCodeId(process.env.AUTOTASK_DEFAULT_BILLING_CODE_ID);
-  if (defaultBillingCodeId !== undefined) autotaskConfig.defaultBillingCodeId = defaultBillingCodeId;
+  // Default work type: env mode only, because a billing code ID belongs to one
+  // tenant. There a bad value is a startup error. Gateway mode ignores the
+  // setting, so it is not parsed and a typo in it cannot stop the server.
+  if (authMode === 'gateway') {
+    if (process.env.AUTOTASK_DEFAULT_BILLING_CODE_ID?.trim()) {
+      stderrWarn.warn('AUTOTASK_DEFAULT_BILLING_CODE_ID is ignored in gateway mode (billing code IDs are tenant-specific).');
+    }
+  } else {
+    const defaultBillingCodeId = parseDefaultBillingCodeId(process.env.AUTOTASK_DEFAULT_BILLING_CODE_ID);
+    if (defaultBillingCodeId !== undefined) autotaskConfig.defaultBillingCodeId = defaultBillingCodeId;
+  }
 
   const transportType = (process.env.MCP_TRANSPORT as TransportType) || 'stdio';
   if (transportType !== 'stdio' && transportType !== 'http') {

@@ -120,11 +120,18 @@ function getAppServer(env: Env): AutotaskMcpServer {
   // Throws on a malformed value, like the Node entry point (the server
   // applies it in env mode only).
   const defaultQueueId = parseDefaultQueueId(env.AUTOTASK_DEFAULT_QUEUE_ID);
-  // The default work type is tenant-specific and never used in gateway mode,
-  // so it is not even parsed there: a stale value cannot fail requests.
-  const defaultBillingCodeId = env.AUTH_MODE === 'gateway'
-    ? undefined
-    : parseDefaultBillingCodeId(env.AUTOTASK_DEFAULT_BILLING_CODE_ID);
+  // Default work type: env mode throws on a malformed value, like the Node
+  // entry point. Gateway mode never applies it (a billing code ID belongs to
+  // one tenant), so it is not parsed there: a typo in a setting the Worker
+  // ignores must not fail every request.
+  let defaultBillingCodeId: number | undefined;
+  if (env.AUTH_MODE === 'gateway') {
+    if (env.AUTOTASK_DEFAULT_BILLING_CODE_ID?.trim()) {
+      logger.warn('AUTOTASK_DEFAULT_BILLING_CODE_ID is ignored in gateway mode (billing code IDs are tenant-specific).');
+    }
+  } else {
+    defaultBillingCodeId = parseDefaultBillingCodeId(env.AUTOTASK_DEFAULT_BILLING_CODE_ID);
+  }
 
   appServer = new AutotaskMcpServer(config, logger, {
     autotask: {

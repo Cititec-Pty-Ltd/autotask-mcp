@@ -113,6 +113,22 @@ describe('loadEnvironmentConfig', () => {
     process.env.AUTOTASK_DEFAULT_BILLING_CODE_ID = 'Remote Support';
     expect(() => loadEnvironmentConfig()).toThrow(/Invalid AUTOTASK_DEFAULT_BILLING_CODE_ID/);
   });
+
+  test('gateway mode does not parse it: a malformed value neither stops startup nor applies', () => {
+    const savedMode = process.env.AUTH_MODE;
+    const warn = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      process.env.AUTH_MODE = 'gateway';
+      process.env.AUTOTASK_DEFAULT_BILLING_CODE_ID = 'Remote Support';
+      expect(loadEnvironmentConfig().autotask.defaultBillingCodeId).toBeUndefined();
+      process.env.AUTOTASK_DEFAULT_BILLING_CODE_ID = '4242';
+      expect(loadEnvironmentConfig().autotask.defaultBillingCodeId).toBeUndefined();
+      expect(warn.mock.calls.some(c => String(c[0]).includes('AUTOTASK_DEFAULT_BILLING_CODE_ID is ignored'))).toBe(true);
+    } finally {
+      if (savedMode === undefined) delete process.env.AUTH_MODE;
+      else process.env.AUTH_MODE = savedMode;
+    }
+  });
 });
 
 describe('autotask_create_ticket with a default work type', () => {
