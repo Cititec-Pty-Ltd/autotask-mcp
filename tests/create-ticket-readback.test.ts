@@ -134,11 +134,13 @@ describe('autotask_create_ticket read-back', () => {
     expect(body.ticket.ticketNumber).toBeUndefined();
   });
 
-  test('picklist failures fall back to the IDs', async () => {
+  test('picklist failures fall back to the IDs and record the vendor status', async () => {
     mockAutotask({ ticket, fieldsStatus: 500 });
     const handler = new AutotaskToolHandler(new AutotaskService(config, logger), logger);
     const body = parse(await handler.callTool('autotask_create_ticket', { ...args, queueID: 8 }));
     expect(body.message).toBe('Created ticket T20261124.0135 (ID 441588) in queue 8, status #1');
+    expect(body.data).toBe(441588);
+    expect(body.ticket.error).toBe('labels: HTTP 500');
   });
 });
 
