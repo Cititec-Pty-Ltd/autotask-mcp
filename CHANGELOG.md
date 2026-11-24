@@ -18,6 +18,10 @@
 
 ### Fixed
 
+- **A malformed `AUTOTASK_DEFAULT_QUEUE_ID` no longer breaks gateway mode.** Gateway mode never applies the default queue, but the Worker parsed the variable on every request and the Node entry point at startup, so a typo failed every Worker request or stopped the server. In gateway mode it is now ignored with a warning and not parsed. Env mode still refuses a malformed value.
+
+- **The ticket title is no longer in the `autotask_create_ticket` message.** The title is tenant free text (email-to-ticket and workflow rules set it), so it is returned only in the structured `ticket` field. The message is `Created ticket T... (ID ...) in <queue>, status <status>`, and `(default queue)` follows the queue when the default was used. If the read-back deadline fires after the ticket GET, the result keeps the ticket number and title and shows the queue and status by ID (`ticket.error: "labels timed out"`).
+
 - **`autotask_create_ticket` read-back is bounded by a 5-second deadline.** The read-back after a create (the ticket, then the queue and status labels) inherited the HTTP client's 60-second timeout per request, so a slow Autotask API could hold the success response past a client's tool-call timeout and invite a retry of a create that had already succeeded (a duplicate ticket). The whole read-back now has one 5-second, cancellable deadline, the budget `autotask_get_company` uses for its labels. On expiry the requests are aborted and the call returns the created ID with `the ticket number could not be read back (timed out)`.
 
 - **`queueID: null` is valid in the `autotask_create_ticket` schema.** With `AUTOTASK_DEFAULT_QUEUE_ID` set, `null` is the way to create a ticket without the default queue, but the schema allowed only a number, so schema-validating clients rejected it. `queueID` is now `type: ["number", "null"]` (still optional), and the static description says what `null` does.
