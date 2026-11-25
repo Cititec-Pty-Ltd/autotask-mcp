@@ -481,6 +481,36 @@ describe('Feature B: autotask_merge_ticket', () => {
     expect(w.tickets[100].status).toBe(1);
   });
 
+  test('a description cut off by a failure is copied again on the retry', async () => {
+    const w = world();
+    w.tickets[100].description = 'd'.repeat(40000);
+    let calls = 0;
+    const base = fakeService(w);
+    const failing = fakeService(w, {
+      createTicketNote: jest.fn(async (id: number, n: any) => {
+        if (id === 200 && ++calls === 2) throw new Error('HTTP 500');
+        return base.createTicketNote(id, n);
+      }),
+    });
+    expect((await handler(failing).callTool('autotask_merge_ticket', { sourceTicketId: 100, targetTicketId: 200 })).isError).toBe(true);
+    expect(w.notes[200]).toHaveLength(1);
+    expect(w.notes[200]![0].description).not.toContain('[source description]');
+    const second = await handler(fakeService(w)).callTool('autotask_merge_ticket', { sourceTicketId: 100, targetTicketId: 200 });
+    expect(second.isError).toBeFalsy();
+    const all = w.notes[200]!.map(n => n.description).join('');
+    expect(all).toContain('[source description]');
+    expect(w.notes[200]!.slice(1).every(n => n.title.startsWith('Merged from T20990101.0001 (more'))).toBe(true);
+  });
+
+  test('a note marker is never split between two target notes, so a re-run does not copy it again', () => {
+    const block = 'x'.repeat(31990) + '\n[source note #1234]';
+    const parts = TicketOps.pack([block], 32000);
+    expect(parts).toHaveLength(2);
+    expect(parts[0]!.length).toBeLessThanOrEqual(32000);
+    expect(parts[1]!.endsWith('\n[source note #1234]')).toBe(true);
+    expect(parts.join('')).toBe(block);
+  });
+
   test('long content is split over several notes within the note length limit', async () => {
     const w = world();
     w.notes[100] = Array.from({ length: 5 }, (_, i) => ({

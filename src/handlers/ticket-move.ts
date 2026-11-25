@@ -49,6 +49,8 @@ export const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
 const MAX_CHILD_RECORDS = AUTOTASK_MAX_PAGE_SIZE;
 /** TicketAttachments title length. */
 const ATTACHMENT_TITLE_MAX = 255;
+/** Last line of the copied header and description on the target. */
+const DESCRIPTION_MARKER = '[source description]';
 /** Autotask's system ticket types that cannot be merged. */
 const PROBLEM_TICKET_TYPE = 3;
 const CHANGE_REQUEST_TICKET_TYPE = 4;
@@ -457,7 +459,17 @@ export class TicketOps {
         cur = block;
         continue;
       }
-      for (let i = 0; i < block.length; i += limit) parts.push(block.slice(i, i + limit));
+      // Too long for one note: cut the text, but keep a closing marker line
+      // ("[source note #id]") whole, at the end of the last piece.
+      const m = /\n\[[^\n\]]*\]$/.exec(block);
+      const tail = m && m[0].length < limit ? m[0] : '';
+      const body = tail ? block.slice(0, block.length - tail.length) : block;
+      let i = 0;
+      while (body.length - i + tail.length > limit) {
+        parts.push(body.slice(i, i + limit));
+        i += limit;
+      }
+      cur = body.slice(i) + tail;
     }
     flush();
     return parts;
@@ -551,11 +563,13 @@ export class TicketOps {
     for (const n of earlier) {
       for (const m of String(n.description ?? '').matchAll(/\[source note #(\d+)\]/g)) copiedIds.add(Number(m[1]));
     }
-    const headerCopied = earlier.length > 0;
+    // The header and description are one block that ends with its own
+    // marker, so they count as copied only once all of it is on the target.
+    const headerCopied = earlier.some(n => String(n.description ?? '').includes(DESCRIPTION_MARKER));
     const blocks: string[] = headerCopied ? [] : [
       `${header}\nSource ticket ${sourceNumber} (ID ${source.id}), ${sourceCompany.name}, created ${TicketOps.when(source.createDate)}.` +
-      '\nCopied by autotask_merge_ticket: this is not an Autotask merge, so Autotask shows no merge link between the tickets.',
-      `Description:\n${(source.description ?? '').trim() || '(none)'}`,
+      '\nCopied by autotask_merge_ticket: this is not an Autotask merge, so Autotask shows no merge link between the tickets.' +
+      `\n\nDescription:\n${(source.description ?? '').trim() || '(none)'}\n${DESCRIPTION_MARKER}`,
     ];
     let notesAlreadyCopied = 0;
     for (const n of sourceNotes) {
@@ -571,10 +585,11 @@ export class TicketOps {
         `\n[source note #${n.id}]`);
     }
     const bodies = blocks.length ? TicketOps.pack(blocks, limits.description) : [];
-    const head = headerCopied ? `${prefix} (more)` : prefix;
+    const more = earlier.length > 0;
+    const head = more ? `${prefix} (more)` : prefix;
     const notes: PlannedNote[] = bodies.map((body, i) => {
       const titleHead = bodies.length === 1 ? head
-        : `${prefix} (${headerCopied ? 'more, ' : ''}part ${i + 1} of ${bodies.length})`;
+        : `${prefix} (${more ? 'more, ' : ''}part ${i + 1} of ${bodies.length})`;
       const full = `${titleHead}: ${source.title ?? ''}`.trim();
       return { title: full.length > limits.title ? full.slice(0, limits.title - 3) + '...' : full, titleHead, description: body };
     });
