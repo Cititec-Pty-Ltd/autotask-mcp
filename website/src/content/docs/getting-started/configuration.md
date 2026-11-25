@@ -22,6 +22,7 @@ description: Configure credentials, transport, and server options.
 | `CONDUIT_S2S_SECRET` | — | Required to start HTTP. Signs `X-Gateway-S2S`. Empty and known placeholders are rejected. |
 | `MCP_ALLOW_INSECURE_DEV` | unset | Set to exactly `1` for local HTTP without a usable secret. Skips `X-Gateway-S2S` and listens on `127.0.0.1` only. |
 | `AUTOTASK_DEFAULT_QUEUE_ID` | unset | Env mode only. Queue ID that `autotask_create_ticket` uses when the call has no `queueID`. An explicit `queueID` always wins. Must be a positive integer; anything else stops the server at startup. Ignored in gateway mode, where queue IDs belong to each tenant. |
+| `AUTOTASK_DEFAULT_BILLING_CODE_ID` | unset | Env mode only. Work type (billing code) ID that `autotask_create_ticket` uses when the call has no `billingCodeID` (see `autotask_list_billing_codes`). An explicit `billingCodeID` always wins. Must be a positive integer; anything else stops the server at startup. Ignored in gateway mode, where billing code IDs belong to each tenant. |
 | `LOG_LEVEL` | `info` | Logging level: `error`, `warn`, `info`, `debug` |
 
 ## Impersonation (optional)

@@ -122,6 +122,7 @@ The Autotask MCP Server exposes 39 tools organized by entity type.
 | `autotask_list_queues` | List all available ticket queues |
 | `autotask_list_ticket_statuses` | List all ticket status values |
 | `autotask_list_ticket_priorities` | List all ticket priority levels |
+| `autotask_list_billing_codes` | List billing codes (work types), filterable by name, use type and active |
 | `autotask_get_field_info` | Get field definitions for any entity type |
 
 ## Response Format

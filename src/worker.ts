@@ -34,6 +34,7 @@ import { Logger } from './utils/logger.js';
 import {
   getServerVersion,
   parseCredentialsFromHeaders,
+  parseDefaultBillingCodeId,
   parseDefaultQueueId,
   parseImpersonationResourceId,
 } from './utils/config.js';
@@ -46,6 +47,7 @@ export interface Env {
   AUTOTASK_API_URL?: string;
   AUTOTASK_IMPERSONATION_RESOURCE_ID?: string;
   AUTOTASK_DEFAULT_QUEUE_ID?: string;
+  AUTOTASK_DEFAULT_BILLING_CODE_ID?: string;
   AUTH_MODE?: string;
   LOG_LEVEL?: string;
   LOG_FORMAT?: string;
@@ -127,9 +129,25 @@ function getAppServer(env: Env): AutotaskMcpServer {
   } else {
     defaultQueueId = parseDefaultQueueId(env.AUTOTASK_DEFAULT_QUEUE_ID);
   }
+  // Default work type: env mode throws on a malformed value, like the Node
+  // entry point. Gateway mode never applies it (a billing code ID belongs to
+  // one tenant), so it is not parsed there: a typo in a setting the Worker
+  // ignores must not fail every request.
+  let defaultBillingCodeId: number | undefined;
+  if (env.AUTH_MODE === 'gateway') {
+    if (env.AUTOTASK_DEFAULT_BILLING_CODE_ID?.trim()) {
+      logger.warn('AUTOTASK_DEFAULT_BILLING_CODE_ID is ignored in gateway mode (billing code IDs are tenant-specific).');
+    }
+  } else {
+    defaultBillingCodeId = parseDefaultBillingCodeId(env.AUTOTASK_DEFAULT_BILLING_CODE_ID);
+  }
 
   appServer = new AutotaskMcpServer(config, logger, {
-    autotask: defaultQueueId !== undefined ? { ...autotask, defaultQueueId } : autotask,
+    autotask: {
+      ...autotask,
+      ...(defaultQueueId !== undefined && { defaultQueueId }),
+      ...(defaultBillingCodeId !== undefined && { defaultBillingCodeId }),
+    },
     server: { name: 'autotask-mcp', version: getServerVersion() },
     transport: { type: 'http', port: 8080, host: '0.0.0.0' },
     logging: {
