@@ -331,12 +331,38 @@ describe('Feature B: autotask_merge_ticket', () => {
     const body = parse(r);
     expect(svc.createTicketAttachment).toHaveBeenCalledTimes(1);
     expect(svc.createTicketAttachment).toHaveBeenCalledWith(200, {
-      title: 'error.png', fullPath: 'error.png', data: w.attachmentData[3001], contentType: 'image/png', publish: 1,
+      title: 'error.png (from T20990101.0001 #3001)', fullPath: 'error.png', data: w.attachmentData[3001], contentType: 'image/png', publish: 1,
     });
     // The oversized file is never downloaded.
     expect(svc.getTicketAttachment).toHaveBeenCalledTimes(1);
     expect(body.message).toContain('Attachment "Vendor KB" not copied: a link (URL), not a file.');
     expect(body.message).toContain(`Attachment "dump.zip" not copied: ${MAX_ATTACHMENT_BYTES + 1} bytes, over Autotask's`);
+  });
+
+  test('an unrelated file of the same name and size on the target does not stop the copy', async () => {
+    const w = world();
+    w.attachments[200] = [{ id: 4001, ticketID: 200, title: 'error.png', fullPath: 'error.png', attachmentType: 'FILE_ATTACHMENT', fileSize: 4 }];
+    const svc = fakeService(w);
+    await handler(svc).callTool('autotask_merge_ticket', { sourceTicketId: 100, targetTicketId: 200 });
+    expect(svc.createTicketAttachment).toHaveBeenCalledTimes(1);
+    expect(w.attachments[200]!.map(a => a.title)).toEqual(['error.png', 'error.png (from T20990101.0001 #3001)']);
+  });
+
+  test('a full page of notes or attachments (the list may be cut short) is refused', async () => {
+    for (const which of ['source notes', 'target notes', 'source attachments', 'target attachments']) {
+      const w = world();
+      const many = (tid: number) => Array.from({ length: 500 }, (_, i) => ({ id: 10000 + i, ticketID: tid, title: `n${i}`, description: 'x' }));
+      if (which === 'source notes') w.notes[100] = many(100);
+      if (which === 'target notes') w.notes[200] = many(200);
+      if (which === 'source attachments') w.attachments[100] = many(100).map(a => ({ ...a, attachmentType: 'URL' }));
+      if (which === 'target attachments') w.attachments[200] = many(200);
+      const svc = fakeService(w);
+      const r = await handler(svc).callTool('autotask_merge_ticket', { sourceTicketId: 100, targetTicketId: 200 });
+      expect(r.isError).toBe(true);
+      expect(parse(r).error).toContain('500 or more');
+      expect(svc.updateTicket).not.toHaveBeenCalled();
+      expect(svc.createTicketNote).not.toHaveBeenCalled();
+    }
   });
 
   test('company move: the source moves to the target\'s company with its default contract first', async () => {

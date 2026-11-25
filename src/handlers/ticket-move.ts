@@ -13,6 +13,7 @@
 // contractID always wins and must belong to the ticket's (new) company.
 
 import type { AutotaskService } from '../services/autotask.service.js';
+import { AUTOTASK_MAX_PAGE_SIZE } from '../services/autotask-http.js';
 import type { FieldInfo, PicklistCache, PicklistValue } from '../services/picklist.cache.js';
 import type { AutotaskContract, AutotaskTicket, AutotaskTicketAttachment, AutotaskTicketNote } from '../types/autotask.js';
 
@@ -40,8 +41,14 @@ const DEFAULT_NOTE_DESCRIPTION_MAX = 32000;
 const DEFAULT_NOTE_TITLE_MAX = 250;
 /** Autotask's ticket attachment limit, as enforced by createTicketAttachment. */
 export const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
-/** Upper bound on notes/attachments read from one ticket. */
-const MAX_CHILD_RECORDS = 2000;
+/**
+ * Notes and attachments are read with one child query, which returns at most
+ * one page (AUTOTASK_MAX_PAGE_SIZE records). A full page means the list may be
+ * cut short, so the merge is refused rather than copying part of a ticket.
+ */
+const MAX_CHILD_RECORDS = AUTOTASK_MAX_PAGE_SIZE;
+/** TicketAttachments title length. */
+const ATTACHMENT_TITLE_MAX = 255;
 /** Autotask's system ticket types that cannot be merged. */
 const PROBLEM_TICKET_TYPE = 3;
 const CHANGE_REQUEST_TICKET_TYPE = 4;
@@ -493,8 +500,13 @@ export class TicketOps {
       this.s.searchTicketAttachments(source.id as number, { pageSize: MAX_CHILD_RECORDS }),
       this.s.searchTicketAttachments(target.id as number, { pageSize: MAX_CHILD_RECORDS }),
     ]);
-    if (sourceNotesRaw.length >= MAX_CHILD_RECORDS || sourceAttachments.length >= MAX_CHILD_RECORDS) {
-      blockers.push(`The source ticket has ${MAX_CHILD_RECORDS} or more notes or attachments; merge it by hand.`);
+    for (const [what, rows] of [
+      [`notes on ${sourceNumber}`, sourceNotesRaw], [`notes on ${targetNumber}`, targetNotes],
+      [`attachments on ${sourceNumber}`, sourceAttachments], [`attachments on ${targetNumber}`, targetAttachments],
+    ] as const) {
+      if (rows.length >= MAX_CHILD_RECORDS) {
+        blockers.push(`There are ${MAX_CHILD_RECORDS} or more ${what}, more than one read returns, so the merge could not be checked as complete; merge these tickets by hand.`);
+      }
     }
 
     const intoTitle = TicketOps.mergedIntoTitle(targetNumber);
@@ -551,12 +563,19 @@ export class TicketOps {
       n.exists = singleDone || existingTitles.some(t => t.startsWith(`${n.titleHead}:`));
     }
 
-    // Attachments
+    // Attachments. A copy's title names the source ticket and attachment ID
+    // ("error.png (from T... #123)"), so a re-run recognises its own copies and
+    // an unrelated file of the same name on the target never stops a copy.
+    const targetTitles = new Set(targetAttachments.map(t => String(t.title ?? t.fileName ?? '')));
     const attachments: PlannedAttachment[] = sourceAttachments.map(a => {
       const title = (a.title ?? a.fileName ?? `attachment ${a.id}`) as string;
       const type = typeof a.attachmentType === 'string' ? a.attachmentType.toUpperCase() : 'FILE_ATTACHMENT';
       const size = typeof a.fileSize === 'number' ? a.fileSize : undefined;
-      const p: PlannedAttachment = { id: a.id as number, title, action: 'copy' };
+      const tag = ` (from ${sourceNumber} #${a.id})`;
+      const copyTitle = title.length + tag.length > ATTACHMENT_TITLE_MAX
+        ? title.slice(0, Math.max(0, ATTACHMENT_TITLE_MAX - tag.length - 3)) + '...' + tag
+        : title + tag;
+      const p: PlannedAttachment = { id: a.id as number, title, copyTitle, action: 'copy' };
       if (size !== undefined) p.fileSize = size;
       if (type !== 'FILE_ATTACHMENT') {
         p.action = 'skip';
@@ -564,8 +583,7 @@ export class TicketOps {
       } else if (size !== undefined && size > MAX_ATTACHMENT_BYTES) {
         p.action = 'skip';
         p.reason = `${size} bytes, over Autotask's ${MAX_ATTACHMENT_BYTES}-byte attachment limit`;
-      } else if (targetAttachments.some(t => (t.title ?? t.fileName) === title
-        && (size === undefined || typeof t.fileSize !== 'number' || t.fileSize === size))) {
+      } else if (targetTitles.has(copyTitle)) {
         p.action = 'exists';
       }
       return p;
@@ -692,7 +710,7 @@ export class TicketOps {
         }
         const att = full as AutotaskTicketAttachment;
         const req: Parameters<TicketOpsService['createTicketAttachment']>[1] = {
-          title: a.title,
+          title: a.copyTitle,
           fullPath: (att.fullPath as string | undefined) || a.title,
           data: full.data,
         };
@@ -753,6 +771,8 @@ export interface PlannedNote {
 export interface PlannedAttachment {
   id: number;
   title: string;
+  /** Title of the copy on the target: the source title plus "(from <source number> #<attachment id>)". */
+  copyTitle: string;
   fileSize?: number;
   action: 'copy' | 'skip' | 'exists';
   reason?: string;

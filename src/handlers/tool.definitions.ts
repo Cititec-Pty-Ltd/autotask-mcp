@@ -755,7 +755,7 @@ export const TOOL_DEFINITIONS: McpTool[] = [
       '(1) checks both tickets exist, differ and are not Problem or Change Request tickets (Autotask does not merge those), and refuses a source that is already Complete; ' +
       '(2) moves the source to the target\'s company when they differ (same rules as autotask_update_ticket: the new company\'s default contract or no contract, the old company\'s contact removed); ' +
       '(3) adds a note "Merged from <source number>: <title>" to the target with the source description and every source note (author and date each), split over several notes if too long; ' +
-      '(4) copies the source\'s ticket file attachments to the target (links and files over 3 MB are skipped and listed; attachments on notes are not copied); ' +
+      '(4) copies the source\'s ticket file attachments to the target, titled "<name> (from <source number> #<attachment id>)" (links and files over 3 MB are skipped and listed; attachments on notes are not copied); ' +
       '(5) adds a note "Merged into <target number>" to the source and sets it to Complete. ' +
       'Running it again after a partial failure skips what is already done. A partial merge returns an error that lists what was done and what failed. ' +
       'autotask_preview_ticket_merge shows what it will do first.',
