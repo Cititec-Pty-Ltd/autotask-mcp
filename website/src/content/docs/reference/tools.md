@@ -34,6 +34,10 @@ The Autotask MCP Server exposes 39 tools organized by entity type.
 | `autotask_search_tickets` | Search for tickets | `searchTerm`, `companyID`, `status`, `priority`, `queueID`, `assignedResourceID` |
 | `autotask_get_ticket_details` | Get one ticket: description, status/priority/queue, company, contact, assignee, dates, linked configuration item, resolution, custom fields (UDFs) and recent notes, then the full ticket record as JSON | `ticketID` (required), `fullDetails` (untruncated description/resolution and all UDFs) |
 | `autotask_create_ticket` | Create a new ticket | `title`, `companyID` (required), `priority`, `status`, `queueID`, `description` |
+| `autotask_update_ticket` | Update a ticket. A company move sets the new company's default contract (or none) and removes the old company's contact; the result states old and new company, contract and queue | `ticketId` (required), `companyID`, `contractID`, `queueID`, `contactID`, `status`, `priority` |
+| `autotask_merge_ticket` | Merge-equivalent (not Autotask's native merge): move the source to the target's company, copy its description, notes and file attachments to the target, then note and complete the source | `sourceTicketId`, `targetTicketId` (required), `noteType`, `publish` |
+| `autotask_preview_ticket_merge` | Read-only: what `autotask_merge_ticket` would do, or why it would refuse | `sourceTicketId`, `targetTicketId` (required) |
+| `autotask_get_company_default_contract` | A company's default contract and active contracts | `companyID` (required) |
 
 ## Time Entries
 
