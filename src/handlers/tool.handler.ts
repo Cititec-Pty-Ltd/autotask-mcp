@@ -13,6 +13,7 @@ import { TOOL_DEFINITIONS, TOOL_CATEGORIES } from './tool.definitions.js';
 import { buildTicketCard, fetchRecentTicketNotes, type RecentTicketNotes, type TicketCard } from './card.builder.js';
 import { vendorStatus } from '../utils/vendor-error.js';
 import { buildTicketSearchParams } from './intent-router.js';
+import { TicketOps, TicketOpsError, mergeReport, type TicketChangePlan } from './ticket-move.js';
 
 // Default concurrency for company/resource name enrichment. Autotask allows
 // only a handful of concurrent API threads per integration, so enrichment is
@@ -116,6 +117,14 @@ function buildTicketPayload(args: Record<string, any>): Record<string, any> {
     }
   }
   return payload;
+}
+
+/** noteType / publish for the merge notes, when the caller gave them. */
+function noteOptions(a: Record<string, any>): { noteType?: number; publish?: number } {
+  const out: { noteType?: number; publish?: number } = {};
+  if (typeof a.noteType === 'number') out.noteType = a.noteType;
+  if (typeof a.publish === 'number') out.publish = a.publish;
+  return out;
 }
 
 /** What autotask_create_ticket read back about the ticket it created. */
@@ -481,6 +490,26 @@ export class AutotaskToolHandler {
     const statusLabel = statusID !== undefined ? label('status', statusID) : undefined;
     if (statusLabel) out.status = statusLabel;
     return out;
+  }
+
+  /**
+   * Best-effort lookup of a ticket's contract name. Returns null (never
+   * throws) on any failure.
+   */
+  private async resolveTicketContract(id: number): Promise<Record<string, unknown> | null> {
+    try {
+      const c = await this.autotaskService.getContract(id);
+      if (!c) return null;
+      const contract: Record<string, unknown> = { id };
+      if (c.contractName) contract.name = c.contractName;
+      return contract;
+    } catch (error) {
+      const status = vendorStatus(error);
+      this.logger.warn(
+        `Ticket contract ${id} lookup failed${status !== undefined ? ` (HTTP ${status})` : ''}; returning the ticket with the contract ID only`,
+      );
+      return null;
+    }
   }
 
   /**
@@ -1270,16 +1299,20 @@ export class AutotaskToolHandler {
         // The contact is resolved the same way so the model gets a name, not
         // just contactID.
         if (r) {
-          const [ci, contact] = await Promise.all([
+          const [ci, contact, contract] = await Promise.all([
             typeof r.configurationItemID === 'number'
               ? this.resolveLinkedConfigurationItem(r.configurationItemID)
               : Promise.resolve(null),
             typeof r.contactID === 'number'
               ? this.resolveTicketContact(r.contactID)
               : Promise.resolve(null),
+            typeof r.contractID === 'number'
+              ? this.resolveTicketContract(r.contractID)
+              : Promise.resolve(null),
           ]);
           if (ci) (r as Record<string, unknown>).configurationItem = ci;
           if (contact) (r as Record<string, unknown>).contact = contact;
+          if (contract) (r as Record<string, unknown>).contract = contract;
         }
         return { result: r, message: 'Ticket details retrieved successfully' };
       }],
@@ -1311,9 +1344,89 @@ export class AutotaskToolHandler {
       ['autotask_update_ticket', async (a) => {
         const { ticketId, ...rest } = a;
         const payload = buildTicketPayload(rest);
+        // companyID, contractID and queueID are planned against the current
+        // ticket: a company change also sets the new company's default
+        // contract and drops a contact, configuration item or location of
+        // the old company (Autotask's API does none of this by itself).
+        const moving = rest.companyID !== undefined || rest.contractID !== undefined || rest.queueID !== undefined;
+        let plan: TicketChangePlan | undefined;
+        let ticketNumber: string | undefined;
+        if (moving) {
+          const ops = new TicketOps(s, this.picklistCache);
+          const ticket = await ops.loadTicket(ticketId);
+          ticketNumber = ticket.ticketNumber;
+          plan = await ops.planTicketChange(ticket, {
+            companyID: rest.companyID,
+            contractID: rest.contractID,
+            queueID: rest.queueID,
+            contactID: rest.contactID,
+          });
+          // The plan decides these: only what actually changes is sent.
+          delete payload.companyID;
+          delete payload.queueID;
+          if (plan.company) delete payload.contactID;
+          Object.assign(payload, plan.payload);
+        }
         await this.fillAssignedResourceRole(payload, rest.assignedResourceRoleName);
         await s.updateTicket(ticketId, payload);
-        return { result: ticketId, message: `Successfully updated ticket ${ticketId}` };
+        if (!plan || plan.lines.length === 0) {
+          return { result: ticketId, message: `Successfully updated ticket ${ticketId}` };
+        }
+        const changes: Record<string, unknown> = {};
+        if (plan.company) changes.company = plan.company;
+        if (plan.contract) changes.contract = plan.contract;
+        if (plan.queue) changes.queue = plan.queue;
+        if (plan.contact) changes.contact = plan.contact;
+        if (plan.cleared.length) changes.cleared = plan.cleared;
+        return {
+          result: ticketId,
+          message: `Updated ticket ${ticketNumber ?? ticketId} (ID ${ticketId}). ${plan.lines.join(' ')}`,
+          extra: { changes },
+        };
+      }],
+      ['autotask_merge_ticket', async (a) => {
+        const ops = new TicketOps(s, this.picklistCache);
+        const plan = await ops.planMerge(a.sourceTicketId, a.targetTicketId, noteOptions(a));
+        const outcome = await ops.executeMerge(plan);
+        const message = mergeReport(outcome, plan);
+        // A partial merge is an error result, never a success: the report
+        // says what was done, what failed and that a re-run finishes it.
+        if (!outcome.ok) throw new TicketOpsError(message);
+        return {
+          result: { sourceTicketId: plan.source.id, targetTicketId: plan.target.id, done: outcome.done, skipped: outcome.skipped },
+          message,
+        };
+      }],
+      ['autotask_preview_ticket_merge', async (a) => {
+        const ops = new TicketOps(s, this.picklistCache);
+        const plan = await ops.planMerge(a.sourceTicketId, a.targetTicketId, noteOptions(a));
+        const preview = TicketOps.describePlan(plan);
+        const message = preview.canMerge
+          ? `Merging ${plan.source.ticketNumber} into ${plan.target.ticketNumber} is possible. Nothing was changed.`
+          : `autotask_merge_ticket would refuse this merge: ${preview.blockers.join(' ')}`;
+        return { result: preview, message };
+      }],
+      ['autotask_get_company_default_contract', async (a) => {
+        const id = a.companyID;
+        if (typeof id !== 'number' || !Number.isInteger(id) || id < 0) {
+          throw new Error('companyID is required and must be a non-negative integer');
+        }
+        const company = await s.getCompany(id);
+        if (!company) return { result: null, message: '' };
+        const ops = new TicketOps(s, this.picklistCache);
+        const name = company.companyName || `company ${id}`;
+        const [onMove, active] = await Promise.all([ops.contractOnMove(id, name), ops.activeContracts(id)]);
+        const result = {
+          companyName: name,
+          defaultContract: onMove.to.id === null ? null : { id: onMove.to.id, contractName: onMove.to.name },
+          contractOnMove: onMove.to.id === null
+            ? `no contract: ${name} has no default contract`
+            : `${onMove.to.name} (ID ${onMove.to.id}), the default contract of ${name}`,
+          activeContracts: active.map(c => ({
+            id: c.id, contractName: c.contractName, isDefaultContract: c.isDefaultContract === true,
+          })),
+        };
+        return { result, message: `When a ticket moves to ${name}, its contract becomes: ${result.contractOnMove}` };
       }],
       // Ticket Charges
       ['autotask_get_ticket_charge', async (a) => {

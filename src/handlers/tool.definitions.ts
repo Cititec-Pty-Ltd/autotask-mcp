@@ -677,7 +677,10 @@ export const TOOL_DEFINITIONS: McpTool[] = [
   },
   {
     name: 'autotask_update_ticket',
-    description: 'Update ticket record. Only provided fields are changed.',
+    description: 'Update ticket record. Only provided fields are changed. ' +
+      'Moving a ticket to another company (companyID) works like the Autotask UI: unless contractID is given, the ticket\'s contract becomes the new company\'s default contract (its active contract marked default), or no contract when the new company has none. ' +
+      'A contact, configuration item or company location of the old company is removed from the ticket (pass contactID to set a contact of the new company). ' +
+      'The result states the old and new company, contract and queue. autotask_get_company_default_contract shows the contract a move would set.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -718,8 +721,20 @@ export const TOOL_DEFINITIONS: McpTool[] = [
           description: 'Due date and time in ISO 8601 format (e.g. 2026-03-15T17:00:00Z)'
         },
         contactID: {
+          type: ['number', 'null'],
+          description: 'Contact ID for the ticket. When companyID moves the ticket, it must be a contact of the new company; null removes the contact.'
+        },
+        companyID: {
           type: 'number',
-          description: 'Contact ID for the ticket'
+          description: 'Move the ticket to this company. Unless contractID is given, the contract becomes the new company\'s default contract, or none when it has no default contract. A contact of the old company is removed unless contactID names one of the new company.'
+        },
+        contractID: {
+          type: ['number', 'null'],
+          description: 'Contract ID for the ticket. Must be an active contract of the ticket\'s company (the new one when companyID is given). Leave it out on a move to use the new company\'s default contract; null removes the contract.'
+        },
+        queueID: {
+          type: ['number', 'null'],
+          description: 'Queue ID to move the ticket to (see autotask_list_queues). null removes the queue.'
         },
         issueType: {
           type: 'number',
@@ -731,6 +746,62 @@ export const TOOL_DEFINITIONS: McpTool[] = [
         }
       },
       required: ['ticketId']
+    }
+  },
+  {
+    name: 'autotask_merge_ticket',
+    description: 'Merge one ticket into another, the way the API allows. NOT Autotask\'s native merge (the Autotask API has none): ' +
+      'Autotask shows no merge link between the tickets. In one call it: ' +
+      '(1) checks both tickets exist, differ and are not Problem or Change Request tickets (Autotask does not merge those), and refuses a source that is already Complete; ' +
+      '(2) moves the source to the target\'s company when they differ (same rules as autotask_update_ticket: the new company\'s default contract or no contract, the old company\'s contact removed); ' +
+      '(3) adds a note "Merged from <source number>: <title>" to the target with the source description and every source note (author and date each), split over several notes if too long; ' +
+      '(4) copies the source\'s ticket file attachments to the target (links and files over 3 MB are skipped and listed; attachments on notes are not copied); ' +
+      '(5) adds a note "Merged into <target number>" to the source and sets it to Complete. ' +
+      'Running it again after a partial failure skips what is already done. A partial merge returns an error that lists what was done and what failed. ' +
+      'autotask_preview_ticket_merge shows what it will do first.',
+    annotations: {
+      title: 'Merge ticket (copy into target, close source)',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sourceTicketId: { type: 'number', description: 'ID of the ticket to merge (it is closed afterwards)' },
+        targetTicketId: { type: 'number', description: 'ID of the ticket that receives the content' },
+        noteType: { type: 'number', description: 'Note type for the merge notes. Default: the tenant\'s default ticket note type.' },
+        publish: { type: 'number', description: 'Visibility of the merge notes. Default: the tenant\'s "Internal ..." visibility. See autotask_get_field_info (entityType "TicketNotes", fieldName "publish").' }
+      },
+      required: ['sourceTicketId', 'targetTicketId']
+    }
+  },
+  {
+    name: 'autotask_preview_ticket_merge',
+    description: 'Read-only. Shows what autotask_merge_ticket would do for these two tickets, and whether it would refuse (canMerge, blockers): the company move and the contract it sets, the notes and attachments it copies, what happens to the source. Changes nothing.',
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sourceTicketId: { type: 'number', description: 'ID of the ticket that would be merged and closed' },
+        targetTicketId: { type: 'number', description: 'ID of the ticket that would receive the content' },
+        noteType: { type: 'number', description: 'As for autotask_merge_ticket' },
+        publish: { type: 'number', description: 'As for autotask_merge_ticket' }
+      },
+      required: ['sourceTicketId', 'targetTicketId']
+    }
+  },
+  {
+    name: 'autotask_get_company_default_contract',
+    description: 'Read-only. A company\'s default contract (its active contract marked default; Autotask allows one per company), which is the contract a ticket gets when it moves to that company, plus the company\'s active contracts.',
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        companyID: { type: 'number', description: 'Company ID' }
+      },
+      required: ['companyID']
     }
   },
 
@@ -3473,7 +3544,7 @@ export const TOOL_CATEGORIES: Record<string, { description: string; tools: strin
   },
   tickets: {
     description: 'Search, create, update tickets and manage ticket notes, attachments, charges, and audit history',
-    tools: ['autotask_search_tickets', 'autotask_get_ticket_details', 'autotask_create_ticket', 'autotask_update_ticket', 'autotask_get_ticket_note', 'autotask_search_ticket_notes', 'autotask_create_ticket_note', 'autotask_get_ticket_attachment', 'autotask_search_ticket_attachments', 'autotask_create_ticket_attachment', 'autotask_get_ticket_note_attachment', 'autotask_search_ticket_note_attachments', 'autotask_get_ticket_charge', 'autotask_search_ticket_charges', 'autotask_create_ticket_charge', 'autotask_update_ticket_charge', 'autotask_delete_ticket_charge', 'autotask_get_ticket_history', 'autotask_search_ticket_history']
+    tools: ['autotask_search_tickets', 'autotask_get_ticket_details', 'autotask_create_ticket', 'autotask_update_ticket', 'autotask_merge_ticket', 'autotask_preview_ticket_merge', 'autotask_get_ticket_note', 'autotask_search_ticket_notes', 'autotask_create_ticket_note', 'autotask_get_ticket_attachment', 'autotask_search_ticket_attachments', 'autotask_create_ticket_attachment', 'autotask_get_ticket_note_attachment', 'autotask_search_ticket_note_attachments', 'autotask_get_ticket_charge', 'autotask_search_ticket_charges', 'autotask_create_ticket_charge', 'autotask_update_ticket_charge', 'autotask_delete_ticket_charge', 'autotask_get_ticket_history', 'autotask_search_ticket_history']
   },
   projects: {
     description: 'Search and create projects, tasks, phases, and project notes',
@@ -3485,7 +3556,7 @@ export const TOOL_CATEGORIES: Record<string, { description: string; tools: strin
   },
   financial: {
     description: 'Quotes, quote items, opportunities, invoices, and contracts',
-    tools: ['autotask_get_quote', 'autotask_search_quotes', 'autotask_create_quote', 'autotask_get_quote_item', 'autotask_search_quote_items', 'autotask_create_quote_item', 'autotask_update_quote_item', 'autotask_delete_quote_item', 'autotask_get_opportunity', 'autotask_search_opportunities', 'autotask_create_opportunity', 'autotask_update_opportunity', 'autotask_search_invoices', 'autotask_search_contracts', 'autotask_get_contract', 'autotask_list_expiring_contracts', 'autotask_search_contract_services', 'autotask_search_contract_service_units', 'autotask_search_contract_service_bundles', 'autotask_search_contract_service_bundle_units', 'autotask_get_contract_recurring_lines', 'autotask_create_contract', 'autotask_create_contracts_bulk', 'autotask_update_contract', 'autotask_create_contract_service', 'autotask_update_contract_service']
+    tools: ['autotask_get_quote', 'autotask_search_quotes', 'autotask_create_quote', 'autotask_get_quote_item', 'autotask_search_quote_items', 'autotask_create_quote_item', 'autotask_update_quote_item', 'autotask_delete_quote_item', 'autotask_get_opportunity', 'autotask_search_opportunities', 'autotask_create_opportunity', 'autotask_update_opportunity', 'autotask_search_invoices', 'autotask_search_contracts', 'autotask_get_contract', 'autotask_get_company_default_contract', 'autotask_list_expiring_contracts', 'autotask_search_contract_services', 'autotask_search_contract_service_units', 'autotask_search_contract_service_bundles', 'autotask_search_contract_service_bundle_units', 'autotask_get_contract_recurring_lines', 'autotask_create_contract', 'autotask_create_contracts_bulk', 'autotask_update_contract', 'autotask_create_contract_service', 'autotask_update_contract_service']
   },
   products_and_services: {
     description: 'Products, services, and service bundles catalog',

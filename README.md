@@ -454,6 +454,9 @@ The server provides 102 tools for interacting with Autotask:
 - `autotask_search_tickets` - Search tickets with filters
 - `autotask_get_ticket_details` - Get a ticket by ID: description, status/priority/queue, company, contact, assignee, dates, linked configuration item, resolution, custom fields (UDFs), recent notes and the full record (`fullDetails: true` for untruncated text and all UDFs)
 - `autotask_create_ticket` - Create new ticket
+- `autotask_update_ticket` - Update a ticket. `companyID` moves it to another company like the Autotask UI does: the contract becomes the new company's default contract (or none when it has no default), and a contact, configuration item or location of the old company is removed. Also `contractID` and `queueID`. The result states old and new company, contract and queue
+- `autotask_merge_ticket` - Merge one ticket into another (not Autotask's native merge, which the API does not offer; Autotask shows no merge link): moves the source to the target's company if needed, copies its description, notes and file attachments to the target, adds a "Merged into" note to the source and completes it. Safe to run again after a partial failure
+- `autotask_preview_ticket_merge` - Read-only: what `autotask_merge_ticket` would do, or why it would refuse
 
 #### Time Entry Operations
 - `autotask_create_time_entry` - Log time entry
@@ -492,6 +495,7 @@ The server provides 102 tools for interacting with Autotask:
 #### Contract Operations
 - `autotask_search_contracts` - Search contracts (name, company, status, type, end-date range)
 - `autotask_get_contract` - Get a single contract by ID
+- `autotask_get_company_default_contract` - A company's default contract (the one a ticket gets when it moves there) and its active contracts
 - `autotask_list_expiring_contracts` - Expiring/expired contracts report (next N days, per company or org-wide)
 - `autotask_create_contract` / `autotask_create_contracts_bulk` - Create contract shells, one or many
 - `autotask_update_contract` - Update a contract (e.g. extend/renew end date)
