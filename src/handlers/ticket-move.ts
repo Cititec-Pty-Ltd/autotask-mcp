@@ -541,27 +541,43 @@ export class TicketOps {
     const prefix = TicketOps.mergedFromPrefix(sourceNumber);
     const header = `${prefix}: ${source.title ?? ''}`.trim();
     const sourceCompany = await this.companyRef(source.companyID);
-    const blocks: string[] = [
+    // What an earlier run already copied: the target notes this merge wrote
+    // (title starts with the header) and, inside them, the "[source note #id]"
+    // line that ends every copied note. A retry copies only what is missing,
+    // including notes added to the source since the failed attempt.
+    const earlier = targetNotes.filter(n => typeof n.title === 'string'
+      && (n.title.startsWith(`${prefix}:`) || n.title.startsWith(`${prefix} (`)));
+    const copiedIds = new Set<number>();
+    for (const n of earlier) {
+      for (const m of String(n.description ?? '').matchAll(/\[source note #(\d+)\]/g)) copiedIds.add(Number(m[1]));
+    }
+    const headerCopied = earlier.length > 0;
+    const blocks: string[] = headerCopied ? [] : [
       `${header}\nSource ticket ${sourceNumber} (ID ${source.id}), ${sourceCompany.name}, created ${TicketOps.when(source.createDate)}.` +
       '\nCopied by autotask_merge_ticket: this is not an Autotask merge, so Autotask shows no merge link between the tickets.',
       `Description:\n${(source.description ?? '').trim() || '(none)'}`,
     ];
+    let notesAlreadyCopied = 0;
     for (const n of sourceNotes) {
+      if (typeof n.id === 'number' && copiedIds.has(n.id)) {
+        notesAlreadyCopied++;
+        continue;
+      }
       const author = await this.noteAuthor(n);
       const title = typeof n.title === 'string' && n.title.trim() ? n.title.trim() : 'Note';
-      blocks.push(`--- ${title} | ${author}, ${TicketOps.when(n.createDateTime ?? n.createDate)} ---\n${(n.description ?? '').trim()}`);
+      // The marker goes last, so a note split across two target notes counts
+      // as copied only once its end is on the target.
+      blocks.push(`--- ${title} | ${author}, ${TicketOps.when(n.createDateTime ?? n.createDate)} ---\n${(n.description ?? '').trim()}` +
+        `\n[source note #${n.id}]`);
     }
-    const bodies = TicketOps.pack(blocks, limits.description);
+    const bodies = blocks.length ? TicketOps.pack(blocks, limits.description) : [];
+    const head = headerCopied ? `${prefix} (more)` : prefix;
     const notes: PlannedNote[] = bodies.map((body, i) => {
-      const titleHead = bodies.length === 1 ? prefix : `${prefix} (part ${i + 1} of ${bodies.length})`;
+      const titleHead = bodies.length === 1 ? head
+        : `${prefix} (${headerCopied ? 'more, ' : ''}part ${i + 1} of ${bodies.length})`;
       const full = `${titleHead}: ${source.title ?? ''}`.trim();
       return { title: full.length > limits.title ? full.slice(0, limits.title - 3) + '...' : full, titleHead, description: body };
     });
-    const existingTitles = targetNotes.map(n => (typeof n.title === 'string' ? n.title : ''));
-    const singleDone = existingTitles.some(t => t.startsWith(`${prefix}:`));
-    for (const n of notes) {
-      n.exists = singleDone || existingTitles.some(t => t.startsWith(`${n.titleHead}:`));
-    }
 
     // Attachments. A copy's title names the source ticket and attachment ID
     // ("error.png (from T... #123)"), so a re-run recognises its own copies and
@@ -597,6 +613,8 @@ export class TicketOps {
       notes,
       attachments,
       sourceNoteCount: sourceNotes.length,
+      notesAlreadyCopied,
+      headerCopied,
       sourceAlreadyMarked: alreadyMarked,
       sourceComplete,
     };
@@ -612,7 +630,6 @@ export class TicketOps {
     const files = plan.attachments.filter(a => a.action === 'copy').length;
     const skipped = plan.attachments.filter(a => a.action === 'skip');
     const present = plan.attachments.filter(a => a.action === 'exists').length;
-    const newNotes = plan.notes.filter(n => !n.exists).length;
     const cc = plan.companyChange;
     return {
       canMerge: plan.blockers.length === 0,
@@ -629,9 +646,9 @@ export class TicketOps {
         ? (cc.contract.to.id === null ? `no contract (${cc.contract.reason})` : `${refText(cc.contract.to)} (${cc.contract.reason})`)
         : 'unchanged',
       contactAfterMove: cc?.contact ? `${refText(cc.contact.from)} removed (${cc.contact.reason})` : 'unchanged',
-      notesToTarget: plan.notes.length === 0 ? 'none'
-        : `${plan.sourceNoteCount} source note(s) and the description in ${plan.notes.length} note(s) on ${plan.target.ticketNumber}` +
-          (newNotes < plan.notes.length ? ` (${plan.notes.length - newNotes} already there)` : ''),
+      notesToTarget: (plan.notes.length === 0 ? 'nothing new'
+        : `${plan.sourceNoteCount - plan.notesAlreadyCopied} source note(s)${plan.headerCopied ? '' : ' and the description'} in ${plan.notes.length} note(s) on ${plan.target.ticketNumber}`) +
+        (plan.headerCopied ? ` (${plan.notesAlreadyCopied} note(s) and the description already copied)` : ''),
       attachments: `${files} to copy` + (present ? `, ${present} already on the target` : '') +
         (skipped.length ? `, ${skipped.length} skipped (${skipped.map(a => `${a.title}: ${a.reason}`).join('; ')})` : ''),
       sourceAfter: `note "${TicketOps.mergedIntoTitle(plan.target.ticketNumber)}" and status Complete`,
@@ -671,11 +688,10 @@ export class TicketOps {
     // 2. Content notes on the target
     const noteBase = { noteType: plan.noteType as number, publish: plan.publish as number };
     let notesOk = true;
+    if (plan.headerCopied) {
+      skipped.push(`The description and ${plan.notesAlreadyCopied} source note(s) are already on ${tgt.ticketNumber}.`);
+    }
     for (const n of plan.notes) {
-      if (n.exists) {
-        skipped.push(`Note "${n.title}" is already on ${tgt.ticketNumber}.`);
-        continue;
-      }
       try {
         const id = await this.s.createTicketNote(tgt.id, { ...noteBase, title: n.title, description: n.description });
         done.push(`Added note "${n.title}" (ID ${id}) to ${tgt.ticketNumber}.`);
@@ -700,7 +716,7 @@ export class TicketOps {
       try {
         const full = await this.s.getTicketAttachment(src.id, a.id, { includeData: true, maxInlineBase64Bytes: Number.MAX_SAFE_INTEGER });
         if (!full || typeof full.data !== 'string' || full.data.length === 0) {
-          skipped.push(`Attachment "${a.title}" not copied: Autotask returned no file content for it.`);
+          failed.push(`Copying attachment "${a.title}" failed: Autotask returned no file content for it.`);
           continue;
         }
         const bytes = Buffer.byteLength(full.data, 'base64');
@@ -765,7 +781,6 @@ export interface PlannedNote {
   title: string;
   titleHead: string;
   description: string;
-  exists?: boolean;
 }
 
 export interface PlannedAttachment {
@@ -798,6 +813,10 @@ export interface MergePlan {
   notes: PlannedNote[];
   attachments: PlannedAttachment[];
   sourceNoteCount: number;
+  /** Source notes an earlier run already copied (found by their "[source note #id]" line). */
+  notesAlreadyCopied: number;
+  /** An earlier run already wrote the header and description to the target. */
+  headerCopied: boolean;
   sourceAlreadyMarked: boolean;
   sourceComplete: boolean;
 }

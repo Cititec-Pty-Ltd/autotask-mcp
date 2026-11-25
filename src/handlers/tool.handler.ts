@@ -1399,7 +1399,19 @@ export class AutotaskToolHandler {
       }],
       ['autotask_preview_ticket_merge', async (a) => {
         const ops = new TicketOps(s, this.picklistCache);
-        const plan = await ops.planMerge(a.sourceTicketId, a.targetTicketId, noteOptions(a));
+        let plan;
+        try {
+          plan = await ops.planMerge(a.sourceTicketId, a.targetTicketId, noteOptions(a));
+        } catch (e) {
+          // A refusal (the same ticket twice, a ticket that does not exist) is
+          // a preview result, not a tool error, so an approval guard reading
+          // canMerge can refuse the proposal.
+          if (!(e instanceof TicketOpsError)) throw e;
+          return {
+            result: { canMerge: false, blockers: [e.message], warnings: [] },
+            message: `autotask_merge_ticket would refuse this merge: ${e.message}`,
+          };
+        }
         const preview = TicketOps.describePlan(plan);
         const message = preview.canMerge
           ? `Merging ${plan.source.ticketNumber} into ${plan.target.ticketNumber} is possible. Nothing was changed.`

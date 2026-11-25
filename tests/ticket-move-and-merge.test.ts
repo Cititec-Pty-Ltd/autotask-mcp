@@ -317,7 +317,7 @@ describe('Feature B: autotask_merge_ticket', () => {
     expect(merged[0].description).toMatch(/^Merged from T20990101\.0001: Printer offline\n/);
     expect(merged[0].description).toContain('The printer on level 2 is offline.');
     expect(merged[0].description).toContain('--- Called user | Tech One, 2099-01-01 03:00 UTC ---\nUser says it shows an error.');
-    expect(merged[0].description).toContain('--- Customer reply | Alex Old, 2099-01-01 04:00 UTC ---');
+    expect(merged[0].description).toContain('--- Customer reply | Alex Old, 2099-01-01 04:00 UTC ---\nStill broken.\n[source note #1002]');
 
     const marker = w.notes[100]!.find(n => n.title === 'Merged into T20990101.0002');
     expect(marker).toBeDefined();
@@ -440,7 +440,8 @@ describe('Feature B: autotask_merge_ticket', () => {
     expect(svc.createTicketNote).toHaveBeenCalledTimes(1);
     expect(svc.createTicketNote).toHaveBeenCalledWith(100, expect.objectContaining({ title: 'Merged into T20990101.0002' }));
     const msg = parse(second).message as string;
-    expect(msg).toContain('is already on T20990101.0002');
+    expect(msg).toContain('The description and 2 source note(s) are already on T20990101.0002.');
+    expect(msg).toContain('Attachment "error.png" is already on T20990101.0002.');
     expect(w.tickets[100].status).toBe(COMPLETE);
 
     // A third run on the now Complete, marked source is a no-op, not a refusal.
@@ -450,6 +451,34 @@ describe('Feature B: autotask_merge_ticket', () => {
     expect(svc3.createTicketNote).not.toHaveBeenCalled();
     expect(svc3.updateTicket).not.toHaveBeenCalled();
     expect(svc3.createTicketAttachment).not.toHaveBeenCalled();
+  });
+
+  test('a retry copies source notes added since the failed attempt, and only those', async () => {
+    const w = world();
+    const first = await handler(fakeService(w, { createTicketAttachment: jest.fn().mockRejectedValue(new Error('HTTP 500')) }))
+      .callTool('autotask_merge_ticket', { sourceTicketId: 100, targetTicketId: 200 });
+    expect(first.isError).toBe(true);
+    expect(w.notes[200]).toHaveLength(1);
+    w.notes[100]!.push({ id: 1003, ticketID: 100, title: 'Later', description: 'Added after the failed merge.', creatorResourceID: 30, createDateTime: '2099-01-02T00:00:00Z' });
+    const svc = fakeService(w);
+    const second = await handler(svc).callTool('autotask_merge_ticket', { sourceTicketId: 100, targetTicketId: 200 });
+    expect(second.isError).toBeFalsy();
+    expect(w.notes[200]).toHaveLength(2);
+    const more = w.notes[200]![1];
+    expect(more.title).toBe('Merged from T20990101.0001 (more): Printer offline');
+    expect(more.description).toContain('Added after the failed merge.\n[source note #1003]');
+    expect(more.description).not.toContain('[source note #1001]');
+    expect(more.description).not.toContain('The printer on level 2 is offline.');
+    expect(w.tickets[100].status).toBe(COMPLETE);
+  });
+
+  test('an attachment Autotask returns no content for is a failure, and the source stays open', async () => {
+    const w = world();
+    delete w.attachmentData[3001];
+    const r = await handler(fakeService(w)).callTool('autotask_merge_ticket', { sourceTicketId: 100, targetTicketId: 200 });
+    expect(r.isError).toBe(true);
+    expect(parse(r).error).toContain('Copying attachment "error.png" failed: Autotask returned no file content for it.');
+    expect(w.tickets[100].status).toBe(1);
   });
 
   test('long content is split over several notes within the note length limit', async () => {
@@ -504,6 +533,16 @@ describe('autotask_preview_ticket_merge', () => {
     const body = parse(await handler(fakeService(w)).callTool('autotask_preview_ticket_merge', { sourceTicketId: 100, targetTicketId: 200 }));
     expect(body.data.canMerge).toBe(false);
     expect(body.data.blockers[0]).toContain('Problem');
+  });
+
+  test('the same ticket twice or a missing ticket is canMerge false too (not a tool error), so a guard can refuse it', async () => {
+    const h = handler(fakeService(world()));
+    const same = await h.callTool('autotask_preview_ticket_merge', { sourceTicketId: 100, targetTicketId: 100 });
+    expect(same.isError).toBeFalsy();
+    expect(parse(same).data).toEqual({ canMerge: false, blockers: [expect.stringContaining('same ticket')], warnings: [] });
+    const missing = parse(await h.callTool('autotask_preview_ticket_merge', { sourceTicketId: 404, targetTicketId: 200 }));
+    expect(missing.data.canMerge).toBe(false);
+    expect(missing.data.blockers[0]).toContain('Source ticket 404 was not found');
   });
 });
 
