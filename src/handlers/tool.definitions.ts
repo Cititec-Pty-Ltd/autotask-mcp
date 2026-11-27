@@ -584,11 +584,11 @@ export const TOOL_DEFINITIONS: McpTool[] = [
         },
         status: {
           type: 'number',
-          
+          description: 'Ticket status ID (autotask_list_ticket_statuses). Autotask requires a status; if omitted, Autotask\'s default status is used (New if none is set).'
         },
         priority: {
           type: 'number',
-          
+          description: 'Ticket priority ID (autotask_list_ticket_priorities). Autotask requires a priority; if omitted, Autotask\'s default priority is used. Set it to match the urgency.'
         },
         assignedResourceID: {
           type: 'number',

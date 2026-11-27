@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Bug Fixes
+
+- **`autotask_create_ticket` no longer fails for a missing status or priority.** Autotask requires both on every new ticket and refused the whole request ("Missing Required Field: status"), which a caller only found out after the write was approved. When either is omitted (or null), the server now uses Autotask's own default for that field (the active picklist value marked as the default), with New (1) as the fallback for status. An explicit value always wins, and the success message lists any defaults used. If the priority is omitted and Autotask has no default priority, the call is refused before anything is sent, saying to pass `priority`. The `status` and `priority` descriptions now say this.
+
 ### Documentation
 
 - **Impersonation docs** ([WYREAI-791](https://linear.app/wyre-ai/issue/WYREAI-791)). The README's acting-user section now has:
