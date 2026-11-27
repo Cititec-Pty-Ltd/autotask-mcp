@@ -1196,6 +1196,49 @@ export class AutotaskToolHandler {
   }
 
   /**
+   * Autotask requires status and priority on every new ticket and refuses
+   * the whole POST without them ("Missing Required Field: status"), which a
+   * caller only finds out after the write was approved. When one is omitted
+   * (or null), use Autotask's own default for that field: the active
+   * picklist value marked isDefaultValue. For status, fall back to New (1, a
+   * system status that always exists) when none is marked or the lookup
+   * fails. An explicit value always wins. Returns what was filled in, for
+   * the success message. Throws, before anything is sent, only when the
+   * priority is missing and Autotask has no default priority to use.
+   */
+  private async fillTicketDefaults(payload: Record<string, any>): Promise<string[]> {
+    const used: string[] = [];
+    for (const field of ['status', 'priority'] as const) {
+      if (payload[field] !== undefined && payload[field] !== null) continue;
+      let values: PicklistValue[] = [];
+      try {
+        values = await this.picklistCache.getPicklistValues('Tickets', field);
+      } catch (error) {
+        this.logger.warn(`Ticket ${field} picklist lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      // PicklistCache keeps a failed lookup as an empty list; drop it so the
+      // next ticket tries again.
+      if (!values.length) this.picklistCache.clearCache('Tickets');
+      const fallback = values.find(v => v.isDefaultValue)
+        ?? (field === 'status' ? values.find(v => String(v.value) === '1') : undefined);
+      const id = fallback ? Number(fallback.value) : NaN;
+      if (Number.isInteger(id) && id > 0) {
+        payload[field] = id;
+        used.push(`${field} ${fallback!.label} (${id})`);
+      } else if (field === 'status') {
+        payload.status = 1;
+        used.push('status New (1)');
+      } else {
+        throw new Error(
+          'Autotask requires a priority on every new ticket and has no default priority set, so the ticket ' +
+          'was not created. Pass priority (autotask_list_ticket_priorities lists the IDs).'
+        );
+      }
+    }
+    return used;
+  }
+
+  /**
    * Autotask refuses a ticket that names an assigned resource without that
    * resource's role. Fill the role from the resource's own assignments (or
    * the caller's role name) so a caller need not know role ids.
@@ -1327,18 +1370,20 @@ export class AutotaskToolHandler {
         const usedDefaultWorkType = payload.billingCodeID === undefined && this.defaultBillingCodeId !== undefined;
         if (usedDefaultWorkType) payload.billingCodeID = this.defaultBillingCodeId;
         await this.fillAssignedResourceRole(payload, a.assignedResourceRoleName);
+        const filled = await this.fillTicketDefaults(payload);
         const id = await s.createTicket(payload);
         // The ticket exists from here on: the read-back is best-effort and
         // never turns a created ticket into an error.
         const created = await this.describeCreatedTicket(id);
         // data stays the numeric ID (backward compatible); the read-back,
         // title included, is an extra `ticket` field.
-        const message = createdTicketMessage(created, {
+        let message = createdTicketMessage(created, {
           defaultQueueUsed: usedDefaultQueue,
           defaultQueueId: this.defaultQueueId,
           defaultWorkTypeUsed: usedDefaultWorkType,
           defaultBillingCodeId: this.defaultBillingCodeId,
         });
+        if (filled.length) message += ` Autotask defaults used: ${filled.join(', ')}.`;
         return { result: id, message, extra: { ticket: created } };
       }],
       ['autotask_update_ticket', async (a) => {
